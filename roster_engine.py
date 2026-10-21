@@ -27,7 +27,8 @@ def roster_slot_cols(roster: pd.DataFrame) -> list[str]:
 SLOT_COLS = slot_cols(SLOTS)
 MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
 NAME_RE = re.compile(r"name|staff|officer|employee", re.I)
-SKIP_RE = re.compile(r"^(day|days|date|dates|name|staff|total)$", re.I)
+SKIP_RE = re.compile(r"^(day|days|date|dates|name|staff|total)$|^(total|daily|staff strength|attendance|sub-?total)\b",
+                     re.I)
 
 EXAMPLE_STAFF = ["Aisyah", "Benjamin", "Chloe", "Darren", "Farah", "Gopal",
                  "Hui Min", "Irfan", "Jasmine", "Kelvin", "Lakshmi", "Marcus"]
@@ -127,9 +128,9 @@ def rows_from_paste(text: str) -> list[list]:
     text = (text or "").strip("\r\n")
     if not text.strip():
         return []
-    lines = text.splitlines()
-    delim = "\t" if any("\t" in ln for ln in lines) else ","
-    rows = [[c.strip() or None for c in r] for r in csv.reader(lines, delimiter=delim)]
+    delim = "\t" if "\t" in text else ","
+    rows = [[c.strip() or None for c in r] for r in csv.reader(io.StringIO(text), delimiter=delim)]
+    rows = [r for r in rows if r] or [[None]]
     width = max(len(r) for r in rows)
     return [r + [None] * (width - len(r)) for r in rows]
 
@@ -138,11 +139,39 @@ def _cell(r: list, i: int):
     return r[i] if 0 <= i < len(r) else None
 
 
-def parse_leave(rows: list[list], year: int, month: int) -> tuple[str, dict[str, set[dt.date]]] | None:
-    """Detect the layout and return (layout name, {staff: set of leave dates}), or None if unrecognised.
+def _is_one(v) -> bool:
+    if _is_blank(v):
+        return False
+    try:
+        return float(str(v).strip()) == 1
+    except ValueError:
+        return False
+
+
+def detect_month(rows: list[list], year: int) -> tuple[int, int] | None:
+    """The month a calendar grid covers, read from headers like '1-Dec' or real dates. None for bare day numbers."""
+    for head in rows[:12]:
+        found = []
+        for v in head:
+            if _is_blank(v) or isinstance(v, (int, float)) or re.fullmatch(r"\s*\d{1,2}\s*", str(v)):
+                continue
+            if d := to_date(v, year, 1):
+                found.append((d.year, d.month))
+        if len(found) >= 5:
+            return max(set(found), key=found.count)
+    return None
+
+
+def parse_leave(rows: list[list], year: int, month: int
+                ) -> tuple[str, dict[str, set[dt.date]], set[dt.date]] | None:
+    """Detect the layout and return (layout name, {staff: set of days away}, public holidays),
+    or None if unrecognised.
 
     Layouts:
-      - Calendar grid: names in one column, dates or day numbers across a header row; any mark = leave.
+      - Attendance grid (the office leave plan): names down the side, dates across the top,
+        1 = in office; 0, "off", or a blank cell = away. A date column that is blank for everyone
+        is a public holiday.
+      - Leave-mark grid: same shape, but cells are blank when present and marked (AL, MC, L) when on leave.
       - List: columns named Name, Start (or From/Date) and optionally End (or To/Until).
     """
     for hi, head in enumerate(rows[:12]):
@@ -171,25 +200,44 @@ def parse_leave(rows: list[list], year: int, month: int) -> tuple[str, dict[str,
                     leave[name].add(d)
                     d += dt.timedelta(days=1)
             if leave:
-                return "List (Name / Start / End)", leave
+                return "List (Name / Start / End)", leave, set()
 
         date_cols = [(i, d) for i, v in enumerate(head) if (d := to_date(v, year, month))]
         if len(date_cols) >= 5:
             date_idx = {i for i, _ in date_cols}
             if name_idx < 0:
                 name_idx = next((i for i, v in enumerate(head) if not _is_blank(v) and i not in date_idx), 0)
-            leave = {}
+            people = []
             for r in rows[hi + 1:]:
                 name = "" if _is_blank(_cell(r, name_idx)) else str(_cell(r, name_idx)).strip()
-                if not name or SKIP_RE.match(name):
+                if not name or SKIP_RE.search(name) or to_date(name, year, month):
                     continue
-                marks = leave.setdefault(name, set())
-                for ci, d in date_cols:
-                    cell = r[ci] if ci < len(r) else None
-                    if not _is_blank(cell) and str(cell).strip() not in ("", "0"):
-                        marks.add(d)
-            if leave:
-                return "Calendar grid", leave
+                people.append((name, [_cell(r, ci) for ci, _ in date_cols]))
+            if not people:
+                continue
+
+            filled = [c for _, cells in people for c in cells if not _is_blank(c) and str(c).strip()]
+            attendance = bool(filled) and sum(_is_one(c) for c in filled) / len(filled) >= 0.5
+            holidays = set()
+            if attendance and len(people) >= 2:
+                for j, (_, d) in enumerate(date_cols):
+                    if all(_is_blank(cells[j]) or not str(cells[j]).strip() for _, cells in people):
+                        holidays.add(d)
+
+            leave = {}
+            for name, cells in people:
+                away = leave.setdefault(name, set())
+                for (_, d), cell in zip(date_cols, cells):
+                    if d in holidays:
+                        continue
+                    blank = _is_blank(cell) or not str(cell).strip()
+                    if attendance:
+                        if not _is_one(cell):          # 0, off, AL, blank = not in office
+                            away.add(d)
+                    elif not blank and str(cell).strip() != "0":
+                        away.add(d)
+            layout = "Attendance grid (1 = in office)" if attendance else "Calendar grid (marks = leave)"
+            return layout, leave, holidays
     return None
 
 
@@ -281,17 +329,20 @@ def _week(d: dt.date) -> tuple[int, int]:
 
 # ---------- Roster generation ----------
 
-def workdays(year: int, month: int) -> list[dt.date]:
+def workdays(year: int, month: int, holidays: set[dt.date] | None = None) -> list[dt.date]:
+    """Mon-Fri dates of the month, minus public holidays."""
+    holidays = holidays or set()
     d, out = dt.date(year, month, 1), []
     while d.month == month:
-        if d.weekday() < 5:
+        if d.weekday() < 5 and d not in holidays:
             out.append(d)
         d += dt.timedelta(days=1)
     return out
 
 
 def generate(staff: list[str], leave: dict[str, set[dt.date]], year: int, month: int, seed: int,
-             slots: int = SLOTS, rules: dict[str, dict] | None = None) -> pd.DataFrame:
+             slots: int = SLOTS, rules: dict[str, dict] | None = None,
+             holidays: set[dt.date] | None = None) -> pd.DataFrame:
     """Fill the given number of duty slots per working day.
 
     Rules applied:
@@ -324,7 +375,7 @@ def generate(staff: list[str], leave: dict[str, set[dt.date]], year: int, month:
     cols = slot_cols(slots)
     slot_count = {n: [0] * slots for n in staff}
     records = []
-    for d in workdays(year, month):
+    for d in workdays(year, month, holidays):
         avail = [n for n in staff if eligible(n, d)]
         rng.shuffle(avail)
         avail.sort(key=lambda n: count[n])  # stable, so the shuffle breaks ties fairly

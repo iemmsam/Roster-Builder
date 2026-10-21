@@ -36,8 +36,12 @@ Uploading an .xlsx, .xls or .csv file is still available on the Leave plan tab.
 
 ### Leave plan layouts
 
-- **Calendar grid:** one row per staff, names in the first column, dates or day numbers across a header row
-  (1, 2, 3 … or 1-Nov, Mon 3, 03/11/2026). Any text in a cell (AL, MC, L) counts as leave.
+- **Attendance grid (the office leave plan):** names down the side, dates across the top (1-Dec, 2-Dec …),
+  a weekday row under the dates is fine. **1** = in office; **0**, **off** or blank = away. A date column
+  blank for everyone (e.g. 25-Dec) is a public holiday with no duty. The # column, the Total Working days
+  column and the total/strength rows at the bottom are ignored, so they can be included in the selection.
+  The month is read from the dates and the app switches to it.
+- **Leave-mark grid:** same shape, but blank = present and a mark (AL, MC, L) = on leave.
 - **List:** columns named Name, Start and End (or From/To), one row per leave block.
 
 ### Staff rules table

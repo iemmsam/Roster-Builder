@@ -33,6 +33,7 @@ defaults = {
     "roster": None,
     "editor_ver": 0,
     "rules_ver": 0,
+    "pending_month": None,     # (year, month) read from a pasted plan; applied before the sidebar draws
 }
 for k, v in defaults.items():
     ss.setdefault(k, v)
@@ -46,7 +47,15 @@ def plural(n, word):
 
 
 def load_leave(rows, source, year, month):
-    """Store leave rows if they can be read, and add any new names to the staff table."""
+    """Store leave rows if they can be read, switch to the month they cover, and add new names to the staff table."""
+    ym = eng.detect_month(rows, year) if rows else None
+    if ym:
+        y, m = ym
+        # headers like "1-Jan" carry no year: pick the year closest to the month being planned
+        y = min((y - 1, y, y + 1), key=lambda yy: abs((yy * 12 + m) - (year * 12 + month)))
+        if (y, m) != (year, month):
+            ss.pending_month = (y, m)
+        year, month = y, m
     res = eng.parse_leave(rows, year, month) if rows else None
     if not res:
         ss.leave_msg = ("error", f"Couldn't find staff names and leave dates in the {source.lower()}. "
@@ -64,7 +73,10 @@ def load_leave(rows, source, year, month):
         added = len(new)
     ss.rules_table = table
     ss.rules_ver += 1
-    msg = f"Read {plural(len(names), 'staff member')} as a {res[0].lower()}."
+    msg = f"Read {plural(len(names), 'staff member')} for {calendar.month_name[month]} {year} as an {res[0].lower()}."
+    if res[2]:
+        msg += " Public holiday" + ("s" if len(res[2]) > 1 else "") + ": " + \
+               ", ".join(d.strftime("%-d %b") for d in sorted(res[2])) + " (no duty)."
     if added:
         msg += f" {plural(added, 'name')} added to Staff & rules."
     ss.leave_msg = ("success", msg)
@@ -76,12 +88,17 @@ def clear_leave():
 
 
 # ---------- Sidebar ----------
+ss.setdefault("year_in", next_month.year)
+ss.setdefault("month_in", next_month.month)
+if ss.pending_month:
+    ss.year_in, ss.month_in = ss.pending_month
+    ss.pending_month = None
+
 with st.sidebar:
     st.header("Month")
     c1, c2 = st.columns(2)
-    year = c1.number_input("Year", min_value=2020, max_value=2100, value=next_month.year, step=1)
-    month = c2.selectbox("Month", range(1, 13), index=next_month.month - 1,
-                         format_func=lambda m: calendar.month_abbr[m])
+    year = c1.number_input("Year", min_value=2020, max_value=2100, step=1, key="year_in")
+    month = c2.selectbox("Month", range(1, 13), key="month_in", format_func=lambda m: calendar.month_abbr[m])
     year, month = int(year), int(month)
     slots = int(st.number_input(
         "Duty slots per day", min_value=1, max_value=eng.MAX_SLOTS, value=eng.SLOTS, step=1,
@@ -108,16 +125,22 @@ with tab_leave:
                       horizontal=True, key="leave_method")
     if method == "Paste from Excel":
         st.markdown(
-            "1. In the leave planning Excel, select the whole table, **including the header row** "
-            "with the names and dates.\n"
+            "1. In the leave planning Excel, click the **Name** heading cell and drag to the bottom-right "
+            "of the last staff row, so the selection covers the date row (1-Dec, 2-Dec …), the day row "
+            "and every staff row. Including the # column, the Total columns or the total rows is fine; "
+            "they're ignored.\n"
             "2. Press **Ctrl+C**.\n"
-            "3. Click in the box below, press **Ctrl+V**, then click **Use this leave plan**."
+            "3. Click in the box below, press **Ctrl+V**, then click **Use this leave plan**.\n\n"
+            "The month is read from the dates, so the sidebar switches to it on its own."
         )
         with st.form("leave_paste", clear_on_submit=False):
             text = st.text_area("Leave plan cells", height=200, key="leave_text",
-                                placeholder="Name\t1 Nov\t2 Nov\t3 Nov …\nAisyah\t\tAL\tAL …")
+                                placeholder="Name\t1-Dec\t2-Dec\t3-Dec\t4-Dec …\n\tTue\tWed\tThu\tFri …\n"
+                                            "Lim Boon Chee\t1\t1\t1\toff …\nChew Tee Kit\t1\t1\t0\t0 …")
             if st.form_submit_button("Use this leave plan", type="primary"):
                 load_leave(eng.rows_from_paste(text), "Pasted from Excel", year, month)
+                if ss.pending_month:
+                    st.rerun()
     else:
         up = st.file_uploader("Leave planning Excel", type=["xlsx", "xls", "csv"], help="The first sheet is read.")
         if up is not None and (up.name, up.size) != ss.file_sig:
@@ -126,6 +149,8 @@ with tab_leave:
                 load_leave(eng.read_rows(up.name, up.getvalue()), up.name, year, month)
             except Exception:
                 ss.leave_msg = ("error", f"Couldn't open {up.name}. Make sure it's an Excel or CSV file.")
+            if ss.pending_month:
+                st.rerun()
 
     if ss.leave_msg:
         getattr(st, ss.leave_msg[0])(ss.leave_msg[1])
@@ -134,9 +159,11 @@ with tab_leave:
 
     with st.expander("Accepted layouts"):
         st.markdown(
-            "**Calendar grid**: one row per staff, names in the first column, dates or day numbers across "
-            "the top (1, 2, 3 … or 1-Nov, Mon 3, 03/11/2026). Any text in a cell (AL, MC, L) counts as leave. "
-            "Extra header rows such as weekday names are fine.\n\n"
+            "**Attendance grid** (the office leave plan): names down the side, dates across the top. "
+            "**1** = in office and available for duty. **0**, **off**, or a blank cell = away. "
+            "A date column that's blank for everyone (e.g. 25-Dec) is a public holiday with no duty.\n\n"
+            "**Leave-mark grid**: same shape, but cells are blank when present and marked (AL, MC, L) "
+            "when on leave.\n\n"
             "**List**: columns named *Name*, *Start* and *End* (or From/To), one row per leave block.\n\n"
             "Day numbers on their own are read as days of the month chosen in the sidebar."
         )
@@ -144,9 +171,13 @@ with tab_leave:
 # ---------- Leave for the chosen month ----------
 if ss.raw_rows is not None:
     parsed = eng.parse_leave(ss.raw_rows, year, month)  # re-read: day-number headers depend on the month
-    leave = parsed[1] if parsed else {}
+    leave, holidays = (parsed[1], parsed[2]) if parsed else ({}, set())
+    plan_month = eng.detect_month(ss.raw_rows, year)
+    if plan_month and plan_month[1] != month:
+        st.warning(f"The leave plan is for {calendar.month_name[plan_month[1]]}, but the roster is for "
+                   f"{calendar.month_name[month]}. Change the month in the sidebar, or paste that month's plan.")
 else:
-    leave = eng.example_leave(year, month)
+    leave, holidays = eng.example_leave(year, month), set()
 
 # ---------- Staff & rules tab ----------
 with tab_rules:
@@ -204,12 +235,12 @@ with tab_rules:
         st.warning("Couldn't read the weekday for: " + ", ".join(bad) + ". Use Mon, Tue, Wed, Thu or Fri.")
 
 # ---------- Generate when inputs change ----------
-sig = (tuple(staff), year, month, slots, ss.seed,
+sig = (tuple(staff), year, month, slots, ss.seed, tuple(sorted(holidays)),
        tuple(sorted((n, tuple(sorted(ds))) for n, ds in leave.items())),
        tuple(sorted((n, r["exempt"], tuple(sorted(r["off_days"])), r["max_week"], r["max_month"])
                     for n, r in rules.items())))
 if sig != ss.sig:
-    ss.roster = eng.generate(staff, leave, year, month, ss.seed, slots, rules)
+    ss.roster = eng.generate(staff, leave, year, month, ss.seed, slots, rules, holidays)
     ss.sig = sig
     ss.editor_ver += 1
 
@@ -238,6 +269,19 @@ with banner:
     if on_duty < slots:
         st.warning(f"{plural(on_duty, 'staff member')} can do duty for {plural(slots, 'slot')} a day, so some "
                    "slots will stay unfilled. Add staff or reduce the slots per day.")
+    else:
+        short = []
+        for d in edited["Date"]:
+            d = pd.Timestamp(d).date()
+            n = sum(1 for p in staff if d not in leave.get(p, set()) and not rules.get(p, {}).get("exempt")
+                    and d.weekday() not in rules.get(p, {}).get("off_days", set()))
+            if n < slots:
+                short.append(f"{d:%-d %b} ({n})")
+        if short:
+            st.warning(f"Fewer than {slots} staff are available on {plural(len(short), 'day')}, so those days "
+                       "will have unfilled slots: " + ", ".join(short) + ".")
+    if holidays:
+        st.caption("No duty on public holidays: " + ", ".join(f"{d:%-d %b}" for d in sorted(holidays)) + ".")
     if ss.example_staff or ss.raw_rows is None:
         st.info("Some **example** data is in use. Add your leave plan and staff rules in the first two tabs.")
 

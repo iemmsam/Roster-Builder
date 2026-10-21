@@ -1,6 +1,6 @@
 # Duty Roster Builder
 
-Generates a monthly office duty roster: 8 slots a day, Monday to Friday, built around the staff leave plan.
+Generates a monthly office duty roster: a set number of slots a day (8 by default, changeable in the sidebar), Monday to Friday, built around the staff leave plan.
 
 ## Files
 

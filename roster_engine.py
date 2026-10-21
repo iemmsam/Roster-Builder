@@ -11,8 +11,20 @@ import re
 
 import pandas as pd
 
-SLOTS = 8
-SLOT_COLS = [f"Slot {i + 1}" for i in range(SLOTS)]
+SLOTS = 8  # default; the app lets the user change it
+MAX_SLOTS = 30
+
+
+def slot_cols(n: int) -> list[str]:
+    return [f"Slot {i + 1}" for i in range(n)]
+
+
+def roster_slot_cols(roster: pd.DataFrame) -> list[str]:
+    """Slot columns present in a roster, in order."""
+    return [c for c in roster.columns if str(c).startswith("Slot ")]
+
+
+SLOT_COLS = slot_cols(SLOTS)
 MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
 NAME_RE = re.compile(r"name|staff|officer|employee", re.I)
 SKIP_RE = re.compile(r"^(day|days|date|dates|name|staff|total)$", re.I)
@@ -162,8 +174,9 @@ def workdays(year: int, month: int) -> list[dt.date]:
     return out
 
 
-def generate(staff: list[str], leave: dict[str, set[dt.date]], year: int, month: int, seed: int) -> pd.DataFrame:
-    """Fill 8 slots per working day.
+def generate(staff: list[str], leave: dict[str, set[dt.date]], year: int, month: int, seed: int,
+             slots: int = SLOTS) -> pd.DataFrame:
+    """Fill the given number of duty slots per working day.
 
     Current placeholder rules:
       1. Nobody is rostered on a leave day.
@@ -173,15 +186,16 @@ def generate(staff: list[str], leave: dict[str, set[dt.date]], year: int, month:
     """
     rng = random.Random(seed)
     count = {n: 0 for n in staff}
-    slot_count = {n: [0] * SLOTS for n in staff}
+    cols = slot_cols(slots)
+    slot_count = {n: [0] * slots for n in staff}
     records = []
     for d in workdays(year, month):
         avail = [n for n in staff if d not in leave.get(n, set())]
         rng.shuffle(avail)
         avail.sort(key=lambda n: count[n])  # stable, so the shuffle breaks ties fairly
-        chosen = avail[:SLOTS]
-        row = [None] * SLOTS
-        for s in range(SLOTS):
+        chosen = avail[:slots]
+        row = [None] * slots
+        for s in range(slots):
             if not chosen:
                 break
             chosen.sort(key=lambda n: slot_count[n][s])
@@ -189,18 +203,19 @@ def generate(staff: list[str], leave: dict[str, set[dt.date]], year: int, month:
             row[s] = p
             count[p] += 1
             slot_count[p][s] += 1
-        records.append({"Date": d, "Day": d.strftime("%a"), **dict(zip(SLOT_COLS, row))})
-    return pd.DataFrame(records, columns=["Date", "Day", *SLOT_COLS])
+        records.append({"Date": d, "Day": d.strftime("%a"), **dict(zip(cols, row))})
+    return pd.DataFrame(records, columns=["Date", "Day", *cols])
 
 
 # ---------- Checks ----------
 
 def cell_status(roster: pd.DataFrame, leave: dict[str, set[dt.date]]) -> pd.DataFrame:
     """Same shape as the slot columns: '', 'empty', 'leave' or 'dup' for each cell."""
-    status = pd.DataFrame("", index=roster.index, columns=SLOT_COLS)
+    cols = roster_slot_cols(roster)
+    status = pd.DataFrame("", index=roster.index, columns=cols)
     for idx, row in roster.iterrows():
-        names = [row[c] for c in SLOT_COLS]
-        for c in SLOT_COLS:
+        names = [row[c] for c in cols]
+        for c in cols:
             p = row[c]
             if _is_blank(p) or p == "":
                 status.at[idx, c] = "empty"
@@ -215,7 +230,7 @@ def issues_table(roster: pd.DataFrame, status: pd.DataFrame) -> pd.DataFrame:
     labels = {"empty": "Unfilled slot", "leave": "Rostered while on leave", "dup": "Rostered twice that day"}
     rows = []
     for idx, row in roster.iterrows():
-        for c in SLOT_COLS:
+        for c in roster_slot_cols(roster):
             kind = status.at[idx, c]
             if kind:
                 rows.append({"Date": row["Date"], "Slot": c, "Staff": row[c] or "", "Issue": labels[kind]})
@@ -225,7 +240,7 @@ def issues_table(roster: pd.DataFrame, status: pd.DataFrame) -> pd.DataFrame:
 def tally(roster: pd.DataFrame, staff: list[str], leave: dict[str, set[dt.date]]) -> pd.DataFrame:
     days = list(roster["Date"])
     counts = {n: 0 for n in staff}
-    for c in SLOT_COLS:
+    for c in roster_slot_cols(roster):
         for p in roster[c]:
             if not _is_blank(p) and p != "":
                 counts[p] = counts.get(p, 0) + 1
@@ -244,6 +259,9 @@ FILLS = {"leave": "FBE6E1", "dup": "FBEFD2", "empty": "EEF1F4"}
 def to_excel(roster: pd.DataFrame, status: pd.DataFrame, tally_df: pd.DataFrame,
              issues: pd.DataFrame, title: str) -> bytes:
     from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    cols = roster_slot_cols(roster)
 
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as xw:
@@ -261,11 +279,11 @@ def to_excel(roster: pd.DataFrame, status: pd.DataFrame, tally_df: pd.DataFrame,
             cell.alignment = Alignment(horizontal="center")
         ws.column_dimensions["A"].width = 12
         ws.column_dimensions["B"].width = 6
-        for i in range(SLOTS):
-            ws.column_dimensions[chr(ord("C") + i)].width = 14
+        for i in range(len(cols)):
+            ws.column_dimensions[get_column_letter(3 + i)].width = 14
         for ri, (_, srow) in enumerate(status.iterrows(), start=3):
             ws.cell(row=ri, column=1).number_format = "dd mmm yyyy"
-            for ci, c in enumerate(SLOT_COLS, start=3):
+            for ci, c in enumerate(cols, start=3):
                 kind = srow[c]
                 if kind:
                     ws.cell(row=ri, column=ci).fill = PatternFill("solid", fgColor=FILLS[kind])

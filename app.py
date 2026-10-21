@@ -50,6 +50,10 @@ with st.sidebar:
     month = c2.selectbox("Month", range(1, 13), index=next_month.month - 1,
                          format_func=lambda m: calendar.month_abbr[m])
     year, month = int(year), int(month)
+    slots = int(st.number_input(
+        "Duty slots per day", min_value=1, max_value=eng.MAX_SLOTS, value=eng.SLOTS, step=1,
+        help="How many people are on duty each working day. Changing this regenerates the roster.",
+    ))
 
     st.header("2 · Leave plan")
     up = st.file_uploader("Upload the leave planning Excel", type=["xlsx", "xls", "csv"],
@@ -117,17 +121,20 @@ else:
     leave = eng.example_leave(year, month)
 
 # ---------- Generate when inputs change ----------
-sig = (tuple(staff), year, month, ss.seed,
+sig = (tuple(staff), year, month, slots, ss.seed,
        tuple(sorted((n, tuple(sorted(ds))) for n, ds in leave.items())))
 if sig != ss.sig:
-    ss.roster = eng.generate(staff, leave, year, month, ss.seed)
+    ss.roster = eng.generate(staff, leave, year, month, ss.seed, slots)
     ss.sig = sig
     ss.editor_ver += 1
 
 # ---------- Main page ----------
 title = f"{calendar.month_name[month]} {year}"
 st.title("Duty Roster Builder")
-st.caption("8 duty slots a day · Monday to Friday")
+st.caption(f"{slots} duty slot{'s' if slots != 1 else ''} a day · Monday to Friday")
+if len(staff) < slots:
+    st.warning(f"There are {len(staff)} staff for {slots} slots a day, so some slots will stay unfilled. "
+               "Add staff or reduce the slots per day.")
 if ss.example:
     st.info("You're looking at **example** staff and leave. Upload the leave plan in the sidebar to use your own.")
 
@@ -145,7 +152,7 @@ with tab_roster:
         column_config={
             "Date": st.column_config.DateColumn("Date", format="DD MMM", width="small"),
             "Day": st.column_config.TextColumn("Day", width="small"),
-            **{c: st.column_config.SelectboxColumn(c, options=staff, required=False) for c in eng.SLOT_COLS},
+            **{c: st.column_config.SelectboxColumn(c, options=staff, required=False) for c in eng.slot_cols(slots)},
         },
     )
 
@@ -158,7 +165,7 @@ n_conf = int(status.isin(["leave", "dup"]).sum().sum())
 with summary:
     m1, m2, m3, m4, m5 = st.columns([1, 1, 1, 1, 1.4])
     m1.metric("Working days", len(edited))
-    m2.metric("Slots", len(edited) * eng.SLOTS)
+    m2.metric("Slots", len(edited) * slots)
     m3.metric("Unfilled", n_empty)
     m4.metric("Conflicts", n_conf)
     m5.download_button(
@@ -174,7 +181,8 @@ with tab_review:
                "empty": "background-color:#EEF1F4", "": ""}
     def _styles(df):
         out = pd.DataFrame("", index=df.index, columns=df.columns)
-        out[eng.SLOT_COLS] = status[eng.SLOT_COLS].apply(lambda col: col.map(css_map))
+        cols = list(status.columns)
+        out[cols] = status[cols].apply(lambda col: col.map(css_map))
         return out
     view = edited.copy()
     view["Date"] = pd.to_datetime(view["Date"]).dt.strftime("%d %b")

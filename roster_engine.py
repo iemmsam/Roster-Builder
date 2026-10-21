@@ -542,38 +542,102 @@ FILLS = {"leave": "FBE6E1", "dup": "FBEFD2", "empty": "EEF1F4", "exempt": "E8E1F
          "double": "E1EEF8"}
 
 
+def date_label(d) -> str:
+    """'1-Dec Tue', matching the leave planning sheet's date headers."""
+    d = pd.Timestamp(d)
+    return f"{d.day}-{d:%b} {d:%a}"
+
+
+def to_grid(roster: pd.DataFrame) -> pd.DataFrame:
+    """Dates across the top, slots (AM MSW 1 … PM MSW 8) down the side."""
+    cols = roster_slot_cols(roster)
+    grid = roster.set_index(roster["Date"].map(date_label))[cols].T
+    grid.index.name = "Slot"
+    grid.columns.name = None
+    return grid
+
+
+def from_grid(grid: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame:
+    """Write an edited grid back into the roster's row-per-date shape."""
+    out = roster.copy()
+    labels = roster["Date"].map(date_label)
+    for i, lab in enumerate(labels):
+        if lab in grid.columns:
+            for c in roster_slot_cols(roster):
+                if c in grid.index:
+                    v = grid.at[c, lab]
+                    out.iat[i, out.columns.get_loc(c)] = None if _is_blank(v) or v == "" else v
+    return out
+
+
 def to_excel(roster: pd.DataFrame, status: pd.DataFrame, tally_df: pd.DataFrame,
              issues: pd.DataFrame, title: str) -> bytes:
-    from openpyxl.styles import Alignment, Font, PatternFill
+    """Roster sheet laid out like the leave plan: dates across the top, a weekday row,
+    then one row per slot (AM posts, then PM posts)."""
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
     from openpyxl.utils import get_column_letter
 
     cols = roster_slot_cols(roster)
+    dates = [pd.Timestamp(d).date() for d in roster["Date"]]
 
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as xw:
-        r = roster.copy()
-        r["Date"] = pd.to_datetime(r["Date"])
-        r.to_excel(xw, sheet_name="Roster", index=False, startrow=1)
+        pd.DataFrame().to_excel(xw, sheet_name="Roster")
         tally_df.to_excel(xw, sheet_name="Tally", index=False)
         issues.to_excel(xw, sheet_name="Issues", index=False)
 
         ws = xw.sheets["Roster"]
+        bold, center = Font(bold=True), Alignment(horizontal="center", vertical="center")
+        head_fill = PatternFill("solid", fgColor="DCE6F1")
+        thin = Side(style="thin", color="A6A6A6")
+        thick = Side(style="medium", color="404040")
         ws["A1"] = title
         ws["A1"].font = Font(bold=True, size=14)
-        for cell in ws[2]:
-            cell.font = Font(bold=True)
-            cell.alignment = Alignment(horizontal="center")
-        ws.column_dimensions["A"].width = 12
-        ws.column_dimensions["B"].width = 6
-        for i in range(len(cols)):
-            ws.column_dimensions[get_column_letter(3 + i)].width = 14
-        for ri, (_, srow) in enumerate(status.iterrows(), start=3):
-            ws.cell(row=ri, column=1).number_format = "dd mmm yyyy"
-            for ci, c in enumerate(cols, start=3):
-                kind = srow[c]
+        ws.cell(row=2, column=1, value="Session")
+        ws.cell(row=2, column=2, value="Post")
+        for j, d in enumerate(dates, start=3):
+            c = ws.cell(row=2, column=j, value=d)
+            c.number_format = "d-mmm"
+            ws.cell(row=3, column=j, value=d.strftime("%a"))
+        for rr in (2, 3):
+            for j in range(1, len(dates) + 3):
+                cell = ws.cell(row=rr, column=j)
+                cell.font, cell.alignment, cell.fill = bold, center, head_fill
+                cell.border = Border(top=thin, bottom=thin, left=thin, right=thin)
+
+        r0 = 4
+        for i, col in enumerate(cols):
+            rr = r0 + i
+            sess, post = session_of(col), col.split(" ", 1)[1] if " " in col else col
+            ws.cell(row=rr, column=1, value=sess).font = bold
+            ws.cell(row=rr, column=2, value=post).font = bold
+            last_of_session = i + 1 < len(cols) and session_of(cols[i + 1]) != sess
+            for j in range(1, len(dates) + 3):
+                cell = ws.cell(row=rr, column=j)
+                cell.alignment = center
+                cell.border = Border(top=thin, left=thin, right=thin, bottom=thick if last_of_session else thin)
+            for j, (_, row) in enumerate(roster.iterrows(), start=3):
+                v = row[col]
+                cell = ws.cell(row=rr, column=j, value=None if _is_blank(v) or v == "" else v)
+                kind = status.iat[j - 3, status.columns.get_loc(col)] if col in status.columns else ""
                 if kind:
-                    ws.cell(row=ri, column=ci).fill = PatternFill("solid", fgColor=FILLS[kind])
-        ws.freeze_panes = "C3"
+                    cell.fill = PatternFill("solid", fgColor=FILLS[kind])
+        # merge the session label down its block
+        start = r0
+        for i in range(1, len(cols) + 1):
+            if i == len(cols) or session_of(cols[i]) != session_of(cols[start - r0]):
+                if r0 + i - 1 > start:
+                    ws.merge_cells(start_row=start, start_column=1, end_row=r0 + i - 1, end_column=1)
+                start = r0 + i
+
+        ws.column_dimensions["A"].width = 9
+        ws.column_dimensions["B"].width = 9
+        for j in range(3, len(dates) + 3):
+            ws.column_dimensions[get_column_letter(j)].width = 14
+        ws.freeze_panes = "C4"
+        ws.page_setup.orientation = "landscape"
+        ws.page_setup.fitToWidth = 1
+        ws.sheet_properties.pageSetUpPr.fitToPage = True
 
         for name in ("Tally", "Issues"):
             sh = xw.sheets[name]

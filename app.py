@@ -264,15 +264,17 @@ if sig != ss.sig:
 with tab_roster:
     st.caption("Click any slot to swap someone in. Changing leave, staff, rules, month or duty slots "
                "regenerates the roster and replaces manual edits.")
-    edited = st.data_editor(
-        ss.roster, key=f"roster_{ss.editor_ver}", hide_index=True, use_container_width=True,
-        disabled=["Date", "Day"], height=min(38 * (len(ss.roster) + 1) + 3, 900),
+    grid = eng.to_grid(ss.roster)
+    edited_grid = st.data_editor(
+        grid, key=f"roster_{ss.editor_ver}", hide_index=False, use_container_width=True,
+        height=38 * (len(grid) + 1) + 3,
         column_config={
-            "Date": st.column_config.DateColumn("Date", format="DD MMM", width="small"),
-            "Day": st.column_config.TextColumn("Day", width="small"),
-            **{c: st.column_config.SelectboxColumn(c, options=staff, required=False) for c in eng.slot_cols(posts)},
+            "Slot": st.column_config.TextColumn("Slot", disabled=True, pinned=True),
+            **{c: st.column_config.SelectboxColumn(c, options=staff, required=False, width="medium")
+               for c in grid.columns},
         },
     )
+    edited = eng.from_grid(edited_grid, ss.roster)
 
 status = eng.cell_status(edited, leave, rules, double)
 issues = eng.issues_table(edited, status, rules)
@@ -330,16 +332,14 @@ with tab_review:
                "double": "background-color:#E1EEF8;color:#16466E",
                "empty": "background-color:#EEF1F4", "": ""}
 
-    def _styles(df):
-        out = pd.DataFrame("", index=df.index, columns=df.columns)
-        cols = list(status.columns)
-        out[cols] = status[cols].apply(lambda col: col.map(css_map))
-        return out
+    view = eng.to_grid(edited)
+    status_grid = status.set_axis(view.columns, axis=0).T.reindex(index=view.index)
 
-    view = edited.copy()
-    view["Date"] = pd.to_datetime(view["Date"]).dt.strftime("%d %b")
-    st.dataframe(view.fillna("").style.apply(_styles, axis=None), hide_index=True, use_container_width=True,
-                 height=min(38 * (len(view) + 1) + 3, 900))
+    def _styles(df):
+        return status_grid.apply(lambda col: col.map(css_map))
+
+    st.dataframe(view.fillna("").style.apply(_styles, axis=None), use_container_width=True,
+                 height=38 * (len(view) + 1) + 3)
     st.caption("Blue: does both AM and PM that day · Red: on leave · Amber: two slots in the same half-day "
                "(or AM + PM when not allowed) · Purple: breaks a staff rule · Grey: unfilled")
     if len(issues):

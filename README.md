@@ -70,7 +70,8 @@ Blank cells mean no limit. Pasting updates the people listed and adds anyone new
    (an AM + PM day counts as 2 duties).
 5. **Same slot on the same weekday** (on by default, switch in the sidebar): each weekday keeps one line-up
    all month, so whoever does AM MSW 1 on the first Monday does it every Monday. When that person is away,
-   someone else covers that day only.
+   someone else covers that day only. In the roster and the Excel download, a person in their own weekday
+   slot is shaded **blue** and a stand-in is shaded **yellow**.
 6. Duties are spread evenly, and slot positions rotate.
 
 More criteria go in `generate()` in `roster_engine.py`.

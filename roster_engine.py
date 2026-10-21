@@ -377,7 +377,8 @@ def generate(staff: list[str], leave: dict[str, set[dt.date]], year: int, month:
       5. Weekly pattern (`weekly`): each weekday has a fixed line-up, so whoever has a slot on the first Monday
          has it every Monday. When they're away, someone else covers that day only.
       6. People with the fewest duties so far are picked first; slot positions rotate.
-    The returned frame carries attrs["covers"]: how many slots were filled by someone outside the pattern.
+    The returned frame carries attrs["covers"] (slots filled by someone outside the pattern) and
+    attrs["pattern"] ({weekday 0-4: [person per slot]}).
     """
     rules = rules or {}
     cols = slot_cols(posts)
@@ -485,17 +486,21 @@ def generate(staff: list[str], leave: dict[str, set[dt.date]], year: int, month:
 
     out = pd.DataFrame(records, columns=["Date", "Day", *cols])
     out.attrs["covers"] = covers
+    out.attrs["pattern"] = pattern
     return out
 
 
 # ---------- Checks ----------
 
 def cell_status(roster: pd.DataFrame, leave: dict[str, set[dt.date]],
-                rules: dict[str, dict] | None = None, double: str = "short") -> pd.DataFrame:
-    """Same shape as the slot columns, one code per cell:
-    '' ok, 'empty', 'leave', 'dup' (twice in one half-day, or AM + PM when not allowed),
-    'exempt', 'offday', or 'double' (AM + PM on the same day, allowed; shown for information)."""
+                rules: dict[str, dict] | None = None, double: str = "short",
+                pattern: dict[int, list] | None = None) -> pd.DataFrame:
+    """Same shape as the slot columns, one code per cell. Problems first:
+    'empty', 'leave', 'dup' (twice in one half-day, or AM + PM when not allowed), 'exempt', 'offday'.
+    Otherwise, with a weekly pattern: 'main' (the person's own slot for that weekday) or 'cover'
+    (standing in for the slot's usual holder). Without one: 'double' (AM + PM that day) or ''."""
     rules = rules or {}
+    pattern = pattern or {}
     cols = roster_slot_cols(roster)
     status = pd.DataFrame("", index=roster.index, columns=cols)
     for idx, row in roster.iterrows():
@@ -513,6 +518,10 @@ def cell_status(roster: pd.DataFrame, leave: dict[str, set[dt.date]],
                 status.at[idx, c] = "exempt"
             elif pd.Timestamp(row["Date"]).weekday() in rules.get(p, {}).get("off_days", set()):
                 status.at[idx, c] = "offday"
+            elif pattern:
+                line = pattern.get(pd.Timestamp(row["Date"]).weekday(), [])
+                i = cols.index(c)
+                status.at[idx, c] = "main" if i < len(line) and line[i] == p else "cover"
             elif names.count(p) > 1:
                 status.at[idx, c] = "double"
     return status
@@ -527,7 +536,7 @@ def issues_table(roster: pd.DataFrame, status: pd.DataFrame,
     for idx, row in roster.iterrows():
         for c in roster_slot_cols(roster):
             kind = status.at[idx, c]
-            if kind and kind != "double":
+            if kind in labels:
                 rows.append({"Date": row["Date"], "Slot": c, "Staff": row[c] or "", "Issue": labels[kind]})
     rows += limit_breaches(roster, rules or {})
     return pd.DataFrame(rows, columns=["Date", "Slot", "Staff", "Issue"])
@@ -585,8 +594,9 @@ def tally(roster: pd.DataFrame, staff: list[str], leave: dict[str, set[dt.date]]
 
 # ---------- Excel export ----------
 
-FILLS = {"leave": "FBE6E1", "dup": "FBEFD2", "empty": "EEF1F4", "exempt": "E8E1F5", "offday": "E8E1F5",
-         "double": "E1EEF8"}
+FILLS = {"main": "DDEBF7", "cover": "FFF2A8",
+         "leave": "F8CBC2", "dup": "F9C58D", "empty": "E7E9EC", "exempt": "D9CCF0", "offday": "D9CCF0",
+         "double": "DDF3EC"}
 
 
 def date_label(d) -> str:

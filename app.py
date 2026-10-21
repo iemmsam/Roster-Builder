@@ -263,30 +263,58 @@ sig = (tuple(staff), year, month, tuple(posts), double, weekly, ss.seed, tuple(s
 if sig != ss.sig:
     ss.roster = eng.generate(staff, leave, year, month, ss.seed, posts, rules, holidays, double, weekly)
     ss.covers = ss.roster.attrs.get("covers", 0)
+    ss.pattern = ss.roster.attrs.get("pattern", {})
     ss.sig = sig
     ss.editor_ver += 1
 
 # ---------- Roster tab ----------
+CSS = {"main": "background-color:#DDEBF7;color:#123B63",
+       "cover": "background-color:#FFF2A8;color:#4A3B00",
+       "leave": "background-color:#F8CBC2;color:#7A1F0F;font-weight:600",
+       "dup": "background-color:#F9C58D;color:#5C2E00;font-weight:600",
+       "exempt": "background-color:#D9CCF0;color:#3B2270;font-weight:600",
+       "offday": "background-color:#D9CCF0;color:#3B2270;font-weight:600",
+       "double": "background-color:#DDF3EC;color:#0F4A38",
+       "empty": "background-color:#E7E9EC", "": ""}
+
+
+def legend(weekly_on: bool) -> str:
+    base = ("Blue: their own slot for that weekday · Yellow: covering for the usual person"
+            if weekly_on else "Green: does both AM and PM that day")
+    return (base + " · Red: on leave · Orange: two slots in the same half-day (or AM + PM when not allowed)"
+            " · Purple: breaks a staff rule · Grey: unfilled")
+
+
 with tab_roster:
-    st.caption("Click any slot to swap someone in. Changing leave, staff, rules, month or duty slots "
-               "regenerates the roster and replaces manual edits.")
-    grid = eng.to_grid(ss.roster)
-    edited_grid = st.data_editor(
-        grid, key=f"roster_{ss.editor_ver}", hide_index=False, use_container_width=True,
-        height=38 * (len(grid) + 1) + 3,
-        column_config={
-            "Slot": st.column_config.TextColumn("Slot", disabled=True, pinned=True),
-            **{c: st.column_config.SelectboxColumn(c, options=staff, required=False, width="medium")
-               for c in grid.columns},
-        },
-    )
+    view_box = st.container()
+    with st.expander("Make changes"):
+        st.caption("Click any slot to swap someone in; the coloured roster above updates. Changing leave, staff, "
+                   "rules, month or duty slots regenerates the roster and replaces manual edits.")
+        grid = eng.to_grid(ss.roster)
+        edited_grid = st.data_editor(
+            grid, key=f"roster_{ss.editor_ver}", hide_index=False, use_container_width=True,
+            height=38 * (len(grid) + 1) + 3,
+            column_config={
+                "Slot": st.column_config.TextColumn("Slot", disabled=True, pinned=True),
+                **{c: st.column_config.SelectboxColumn(c, options=staff, required=False, width="medium")
+                   for c in grid.columns},
+            },
+        )
     edited = eng.from_grid(edited_grid, ss.roster)
 
-status = eng.cell_status(edited, leave, rules, double)
+status = eng.cell_status(edited, leave, rules, double, ss.get("pattern") if weekly else None)
 issues = eng.issues_table(edited, status, rules)
 tally = eng.tally(edited, staff, leave)
 n_empty = int((status == "empty").sum().sum())
 n_conf = len(issues) - n_empty
+
+view = eng.to_grid(edited)
+status_grid = status.set_axis(view.columns, axis=0).T.reindex(index=view.index)
+styled = view.fillna("").style.apply(lambda df: status_grid.apply(lambda col: col.map(CSS)), axis=None)
+
+with view_box:
+    st.dataframe(styled, use_container_width=True, height=38 * (len(view) + 1) + 3)
+    st.caption(legend(weekly))
 
 with banner:
     # Fewest people who can cover every slot: one per slot, or one per post when AM + PM doubling is allowed.
@@ -335,23 +363,8 @@ with summary:
 
 # ---------- Review tab ----------
 with tab_review:
-    css_map = {"leave": "background-color:#FBE6E1;color:#8A2A1A;font-weight:600",
-               "dup": "background-color:#FBEFD2;color:#6E4B00;font-weight:600",
-               "exempt": "background-color:#E8E1F5;color:#4B2E83;font-weight:600",
-               "offday": "background-color:#E8E1F5;color:#4B2E83;font-weight:600",
-               "double": "background-color:#E1EEF8;color:#16466E",
-               "empty": "background-color:#EEF1F4", "": ""}
-
-    view = eng.to_grid(edited)
-    status_grid = status.set_axis(view.columns, axis=0).T.reindex(index=view.index)
-
-    def _styles(df):
-        return status_grid.apply(lambda col: col.map(css_map))
-
-    st.dataframe(view.fillna("").style.apply(_styles, axis=None), use_container_width=True,
-                 height=38 * (len(view) + 1) + 3)
-    st.caption("Blue: does both AM and PM that day · Red: on leave · Amber: two slots in the same half-day "
-               "(or AM + PM when not allowed) · Purple: breaks a staff rule · Grey: unfilled")
+    st.dataframe(styled, use_container_width=True, height=38 * (len(view) + 1) + 3)
+    st.caption(legend(weekly))
     if len(issues):
         st.dataframe(issues, hide_index=True, use_container_width=True,
                      column_config={"Date": st.column_config.DateColumn(format="DD MMM YYYY")})

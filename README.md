@@ -1,7 +1,16 @@
 # Duty Roster Builder
 
-Generates a monthly office duty roster, Monday to Friday, built around the staff leave plan. Each duty post
-(MSW 1, MSW 2, MSW 7, MSW 8 by default) has an AM and a PM slot, so 8 slots a day. Posts can be changed in the sidebar.
+Generates a monthly office duty roster, Monday to Friday, built around the staff leave plan.
+
+## Duty slots
+
+Set up on the **Duty slots** tab: one row per slot, with a tick for each weekday it runs. Defaults:
+
+- AM and PM MSW 1, MSW 2, MSW 7, MSW 8: Monday to Friday
+- AM Telehealth and PM Telehealth: Wednesday to Friday
+
+A slot name starting with AM or PM is a half-day slot. Any other name (e.g. "Telehealth") is a full-day slot,
+which uses both halves of that person's day.
 
 ## Files
 
@@ -60,7 +69,7 @@ Blank cells mean no limit. Pasting updates the people listed and adds anyone new
 ## Rules the roster follows
 
 1. Nobody is rostered on a leave day or a public holiday.
-2. Nobody takes two slots in the same half-day (AM or PM).
+2. Nobody takes two slots in the same half-day (AM or PM). A full-day slot counts as both halves.
 3. One person may take an AM and a PM slot on the same day. The sidebar setting decides when:
    - **Only when short of staff** (default): everyone available gets one slot first; people double up only
      to fill slots that would otherwise be empty.

@@ -38,7 +38,9 @@ defaults = {
     "roster": None,
     "editor_ver": 0,
     "rules_ver": 0,
-    "pending_month": None,     # (year, month) read from a pasted plan; applied before the sidebar draws
+    "pending_month": None,
+    "slot_table": None,        # duty slots and the weekdays each runs
+    "slots_ver": 0,     # (year, month) read from a pasted plan; applied before the sidebar draws
 }
 for k, v in defaults.items():
     ss.setdefault(k, v)
@@ -105,13 +107,7 @@ with st.sidebar:
     year = c1.number_input("Year", min_value=2020, max_value=2100, step=1, key="year_in")
     month = c2.selectbox("Month", range(1, 13), key="month_in", format_func=lambda m: calendar.month_abbr[m])
     year, month = int(year), int(month)
-    st.header("Duty slots")
-    posts = eng.parse_posts(st.text_input(
-        "Duty posts", value=", ".join(eng.DEFAULT_POSTS), key="posts_in",
-        help="Separate posts with commas. Each post has an AM and a PM slot.",
-    ))
-    slots = len(eng.slot_cols(posts))
-    st.caption(f"{plural(len(posts), 'post')} × AM and PM = {plural(slots, 'slot')} a day")
+    st.header("Duty rules")
     double = st.selectbox(
         "Same person in an AM and a PM slot", list(eng.DOUBLE_MODES), format_func=eng.DOUBLE_MODES.get,
         key="double_in",
@@ -119,7 +115,6 @@ with st.sidebar:
              "on one day. 'Only when short of staff' gives everyone available one slot first, then doubles "
              "people up to fill what's left.",
     )
-    per_session = len(posts)
     weekly = st.toggle(
         "Same slot on the same weekday", value=True, key="weekly_in",
         help="Each weekday keeps one line-up all month: whoever does AM MSW 1 on the first Monday does it every "
@@ -129,16 +124,17 @@ with st.sidebar:
     if st.button("Reshuffle roster", use_container_width=True,
                  help="Generate a different roster that follows the same rules."):
         ss.seed += 1
-    st.caption("Steps: paste the leave plan, check Staff & rules, then review the roster and download it.")
+    st.caption("Steps: paste the leave plan, check Staff & rules and Duty slots, then review the roster and "
+               "download it.")
 
 title = f"{calendar.month_name[month]} {year}"
 st.title("Duty Roster Builder")
-st.caption(f"AM and PM · {', '.join(posts)} · {plural(slots, 'slot')} a day · Monday to Friday · {title}")
+subtitle = st.empty()
 banner = st.container()
 summary = st.container()
 
-tab_leave, tab_rules, tab_roster, tab_review, tab_fair = st.tabs(
-    ["Leave plan", "Staff & rules", "Roster", "Review", "Fairness"])
+tab_leave, tab_rules, tab_slots, tab_roster, tab_review, tab_fair = st.tabs(
+    ["Leave plan", "Staff & rules", "Duty slots", "Roster", "Review", "Fairness"])
 
 # ---------- Leave plan tab ----------
 with tab_leave:
@@ -255,20 +251,56 @@ with tab_rules:
     if bad:
         st.warning("Couldn't read the weekday for: " + ", ".join(bad) + ". Use Mon, Tue, Wed, Thu or Fri.")
 
+# ---------- Duty slots tab ----------
+with tab_slots:
+    st.markdown("One row per duty slot. Tick the weekdays it runs. A name starting with **AM** or **PM** is a "
+                "half-day slot; any other name (e.g. *Telehealth*) is a full-day slot that uses both halves. "
+                "Add a row at the bottom, or select rows and delete them.")
+    if ss.slot_table is None:
+        ss.slot_table = eng.default_slot_table()
+    slot_edit = st.data_editor(
+        ss.slot_table, key=f"slots_{ss.slots_ver}", num_rows="dynamic", hide_index=True,
+        use_container_width=True,
+        column_config={"Slot": st.column_config.TextColumn("Slot", required=True, width="medium"),
+                       **{w: st.column_config.CheckboxColumn(w, default=True) for w in eng.WEEKDAYS}},
+    )
+    cfg = eng.slot_config(slot_edit)
+    if not cfg:
+        st.warning("No duty slots are set up, so the default slots are used. Add a slot and tick at least one day.")
+        cfg = eng.slot_config()
+    per_day = {w: len(eng.slots_on(cfg, i)) for i, w in enumerate(eng.WEEKDAYS)}
+    st.caption("Slots per day: " + " · ".join(f"{w} {n}" for w, n in per_day.items()))
+    if st.button("Reset to the default slots"):
+        ss.slot_table = eng.default_slot_table()
+        ss.slots_ver += 1
+        st.rerun()
+
+# Short summary of the slot set-up for the page subtitle: "Mon–Tue 8 slots · Wed–Fri 10 slots"
+_groups = []
+for i, w in enumerate(eng.WEEKDAYS):
+    n = len(eng.slots_on(cfg, i))
+    if _groups and _groups[-1][2] == n:
+        _groups[-1][1] = w
+    else:
+        _groups.append([w, w, n])
+subtitle.caption(" · ".join(f"{a}{'–' + b if a != b else ''} {plural(n, 'slot')}" for a, b, n in _groups)
+                 + f" · {title}")
+
 # ---------- Generate when inputs change ----------
-sig = (tuple(staff), year, month, tuple(posts), double, weekly, ss.seed, tuple(sorted(holidays)),
+sig = (tuple(staff), year, month, tuple(cfg), double, weekly, ss.seed, tuple(sorted(holidays)),
        tuple(sorted((n, tuple(sorted(ds))) for n, ds in leave.items())),
        tuple(sorted((n, r["exempt"], tuple(sorted(r["off_days"])), r["max_week"], r["max_month"])
                     for n, r in rules.items())))
 if sig != ss.sig:
-    ss.roster = eng.generate(staff, leave, year, month, ss.seed, posts, rules, holidays, double, weekly)
+    ss.roster = eng.generate(staff, leave, year, month, ss.seed, cfg, rules, holidays, double, weekly)
     ss.covers = ss.roster.attrs.get("covers", 0)
     ss.pattern = ss.roster.attrs.get("pattern", {})
     ss.sig = sig
     ss.editor_ver += 1
 
 # ---------- Roster tab ----------
-CSS = {"main": "background-color:#DDEBF7;color:#123B63",
+CSS = {"na": "background-color:#BFBFBF;color:#BFBFBF",
+       "main": "background-color:#DDEBF7;color:#123B63",
        "cover": "background-color:#FFF2A8;color:#4A3B00",
        "leave": "background-color:#F8CBC2;color:#7A1F0F;font-weight:600",
        "dup": "background-color:#F9C58D;color:#5C2E00;font-weight:600",
@@ -282,7 +314,7 @@ def legend(weekly_on: bool) -> str:
     base = ("Blue: their own slot for that weekday · Yellow: covering for the usual person"
             if weekly_on else "Green: does both AM and PM that day")
     return (base + " · Red: on leave · Orange: two slots in the same half-day (or AM + PM when not allowed)"
-            " · Purple: breaks a staff rule · Grey: unfilled")
+            " · Purple: breaks a staff rule · Light grey: unfilled · Dark grey: slot doesn't run that day")
 
 
 with tab_roster:
@@ -300,9 +332,10 @@ with tab_roster:
                    for c in grid.columns},
             },
         )
-    edited = eng.from_grid(edited_grid, ss.roster)
+    edited = eng.clear_inactive(eng.from_grid(edited_grid, ss.roster), cfg)
 
-status = eng.cell_status(edited, leave, rules, double, ss.get("pattern") if weekly else None)
+status = eng.cell_status(edited, leave, rules, double, ss.get("pattern") if weekly else None, cfg)
+total_slots = int((status != "na").sum().sum())
 issues = eng.issues_table(edited, status, rules)
 tally = eng.tally(edited, staff, leave)
 n_empty = int((status == "empty").sum().sum())
@@ -317,30 +350,30 @@ with view_box:
     st.caption(legend(weekly))
 
 with banner:
-    # Fewest people who can cover every slot: one per slot, or one per post when AM + PM doubling is allowed.
-    need = slots if double == "never" else per_session
+    # Fewest people who can cover every slot: one per slot, or one per half-day when doubling is allowed.
+    need_max = max(eng.people_needed(cfg, wd, double) for wd in range(5))
     on_duty = sum(1 for n in staff if not rules.get(n, {}).get("exempt"))
-    if on_duty < need:
-        st.warning(f"{plural(on_duty, 'staff member')} can do duty for {plural(slots, 'slot')} a day, so some "
-                   "slots will stay unfilled. Add staff or remove a post.")
+    if on_duty < need_max:
+        st.warning(f"{plural(on_duty, 'staff member')} can do duty but the busiest day needs {need_max}, so some "
+                   "slots will stay unfilled. Add staff or remove a slot.")
     else:
         short, doubled = [], []
         for d in edited["Date"]:
             d = pd.Timestamp(d).date()
             n = sum(1 for p in staff if d not in leave.get(p, set()) and not rules.get(p, {}).get("exempt")
                     and d.weekday() not in rules.get(p, {}).get("off_days", set()))
-            if n < need:
+            if n < eng.people_needed(cfg, d.weekday(), double):
                 short.append(f"{d:%-d %b} ({n})")
-            elif double == "short" and n < slots:
+            elif double == "short" and n < len(eng.slots_on(cfg, d.weekday())):
                 doubled.append(f"{d:%-d %b} ({n})")
         if short:
             st.warning(f"Too few staff are available on {plural(len(short), 'day')} to fill every slot, so those "
                        "days have unfilled slots: " + ", ".join(short) + ".")
         if doubled:
-            st.caption(f"Fewer than {slots} staff are in on {plural(len(doubled), 'day')}, so some people do both "
-                       "AM and PM: " + ", ".join(doubled) + ".")
+            st.caption(f"There are fewer staff than slots on {plural(len(doubled), 'day')}, so some people do both "
+                       "an AM and a PM slot: " + ", ".join(doubled) + ".")
     if weekly and len(edited):
-        total = len(edited) * slots
+        total = total_slots
         st.caption(f"Weekly pattern: {total - ss.get('covers', 0)} of {total} slots follow each weekday's line-up. "
                    f"The other {ss.get('covers', 0)} are covers for people who are away that day.")
     if holidays:
@@ -351,7 +384,7 @@ with banner:
 with summary:
     m1, m2, m3, m4, m5 = st.columns([1, 1, 1, 1, 1.4])
     m1.metric("Working days", len(edited))
-    m2.metric("Slots", len(edited) * slots)
+    m2.metric("Slots", total_slots)
     m3.metric("Unfilled", n_empty)
     m4.metric("Conflicts", n_conf)
     m5.download_button(

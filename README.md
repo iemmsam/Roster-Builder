@@ -24,20 +24,44 @@ streamlit run app.py
 3. Click **Create app**, pick the repository, set the main file to `app.py`, and deploy.
 4. Share the app link with the office lead. To keep it private, set the app to private in its settings and invite the lead by email.
 
-## Leave file layouts it reads
+## Adding the leave plan and staff rules
 
-- **Calendar grid:** one row per staff, names in the first column, dates or day numbers (1–31) across a header row. Any text in a cell (AL, MC, L) counts as leave.
-- **List:** columns named Name, Start and End (or From/To), one row per leave block. Dates like `3/11/2026`, `3 Nov 2026` or real Excel dates all work.
+Both can be **pasted from Excel**, so no file upload is needed (useful where uploads are blocked):
 
-## Current rules (placeholders)
+1. In Excel, select the table including its header row and press Ctrl+C.
+2. In the app, open the **Leave plan** or **Staff & rules** tab, click in the paste box and press Ctrl+V.
+3. Click **Use this leave plan** or **Use these rules**.
+
+Uploading an .xlsx, .xls or .csv file is still available on the Leave plan tab.
+
+### Leave plan layouts
+
+- **Calendar grid:** one row per staff, names in the first column, dates or day numbers across a header row
+  (1, 2, 3 … or 1-Nov, Mon 3, 03/11/2026). Any text in a cell (AL, MC, L) counts as leave.
+- **List:** columns named Name, Start and End (or From/To), one row per leave block.
+
+### Staff rules table
+
+| Column | Meaning | Example |
+|---|---|---|
+| Name | Required | Aisyah |
+| Exempt | Y = never rostered | Y |
+| Not available on | Weekdays they can't do duty | Fri, or Mon, Wed |
+| Max per week | Most duties in one week | 2 |
+| Max per month | Most duties in the month | 8 |
+
+Blank cells mean no limit. Pasting updates the people listed and adds anyone new.
+
+## Rules the roster follows
 
 1. Nobody is rostered on a leave day.
 2. One slot per person per day.
-3. Duties are spread evenly, and slot positions rotate.
+3. Exempt staff, "not available" weekdays, and weekly and monthly maximums are respected.
+4. Duties are spread evenly, and slot positions rotate.
 
-Office-specific criteria go in `generate()` in `roster_engine.py`.
+More criteria go in `generate()` in `roster_engine.py`.
 
 ## Notes
 
 - Changing the staff list, leave or month regenerates the roster and replaces manual edits. Download the Excel once the roster is final.
-- Nothing is stored between sessions. The leave file is uploaded each time you build a roster.
+- Nothing is stored between sessions. Paste the leave plan and rules again when you reopen the app.

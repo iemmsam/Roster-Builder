@@ -81,6 +81,10 @@ def to_date(v, year: int, month: int) -> dt.date | None:
                 return dt.date(1899, 12, 30) + dt.timedelta(days=n)
         return None
     s = str(v).strip()
+    s = re.sub(r"^(mon|tue|wed|thu|fri|sat|sun)[a-z]*[\s,.]*", "", s, flags=re.I)   # "Mon 3"
+    s = re.sub(r"[\s,(]*(mon|tue|wed|thu|fri|sat|sun)[a-z]*\)?$", "", s, flags=re.I)  # "3 Mon", "3 (Mon)"
+    if not s:
+        return None
     if m := re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})", s):
         return _valid(int(m[1]), int(m[2]), int(m[3]))
     if m := re.match(r"^(\d{1,2})[/.\-](\d{1,2})[/.\-](\d{2,4})$", s):  # d/m/yyyy, Singapore style
@@ -92,6 +96,14 @@ def to_date(v, year: int, month: int) -> dt.date | None:
         y = int(m[3]) if m[3] else year
         y += 2000 if y < 100 else 0
         return _valid(y, MONTHS.index(m[2].lower()) + 1, int(m[1]))
+    if m := re.match(r"^([A-Za-z]{3})[a-z]*[\s\-]*(\d{1,2})(?:[\s,\-]+(\d{2,4}))?$", s):  # Nov 3, 2026
+        if m[1].lower() not in MONTHS:
+            return None
+        y = int(m[3]) if m[3] else year
+        y += 2000 if y < 100 else 0
+        return _valid(y, MONTHS.index(m[1].lower()) + 1, int(m[2]))
+    if m := re.match(r"^(\d{1,2})[/.](\d{1,2})$", s):  # 3/11 (day/month, chosen year)
+        return _valid(year, int(m[2]), int(m[1]))
     if re.fullmatch(r"\d{1,2}", s):
         return _valid(year, month, int(s))
     return None
@@ -106,6 +118,24 @@ def read_rows(file_name: str, data: bytes) -> list[list]:
         df = pd.read_excel(buf, header=None, sheet_name=0)
     df = df.astype(object).where(pd.notna(df), None)
     return df.values.tolist()
+
+
+def rows_from_paste(text: str) -> list[list]:
+    """Turn cells copied from Excel (tab-separated) or CSV text into raw rows."""
+    import csv
+
+    text = (text or "").strip("\r\n")
+    if not text.strip():
+        return []
+    lines = text.splitlines()
+    delim = "\t" if any("\t" in ln for ln in lines) else ","
+    rows = [[c.strip() or None for c in r] for r in csv.reader(lines, delimiter=delim)]
+    width = max(len(r) for r in rows)
+    return [r + [None] * (width - len(r)) for r in rows]
+
+
+def _cell(r: list, i: int):
+    return r[i] if 0 <= i < len(r) else None
 
 
 def parse_leave(rows: list[list], year: int, month: int) -> tuple[str, dict[str, set[dt.date]]] | None:
@@ -128,14 +158,14 @@ def parse_leave(rows: list[list], year: int, month: int) -> tuple[str, dict[str,
         if name_idx >= 0 and start_idx >= 0:
             leave: dict[str, set[dt.date]] = {}
             for r in rows[hi + 1:]:
-                name = "" if _is_blank(r[name_idx]) else str(r[name_idx]).strip()
+                name = "" if _is_blank(_cell(r, name_idx)) else str(_cell(r, name_idx)).strip()
                 if not name or SKIP_RE.match(name):
                     continue
                 leave.setdefault(name, set())
-                a = to_date(r[start_idx], year, month)
+                a = to_date(_cell(r, start_idx), year, month)
                 if not a:
                     continue
-                b = (to_date(r[end_idx], year, month) if end_idx >= 0 else None) or a
+                b = (to_date(_cell(r, end_idx), year, month) if end_idx >= 0 else None) or a
                 d = a
                 while d <= b and (d - a).days < 370:
                     leave[name].add(d)
@@ -150,7 +180,7 @@ def parse_leave(rows: list[list], year: int, month: int) -> tuple[str, dict[str,
                 name_idx = next((i for i, v in enumerate(head) if not _is_blank(v) and i not in date_idx), 0)
             leave = {}
             for r in rows[hi + 1:]:
-                name = "" if _is_blank(r[name_idx]) else str(r[name_idx]).strip()
+                name = "" if _is_blank(_cell(r, name_idx)) else str(_cell(r, name_idx)).strip()
                 if not name or SKIP_RE.match(name):
                     continue
                 marks = leave.setdefault(name, set())
@@ -161,6 +191,92 @@ def parse_leave(rows: list[list], year: int, month: int) -> tuple[str, dict[str,
             if leave:
                 return "Calendar grid", leave
     return None
+
+
+# ---------- Staff rules ----------
+
+RULE_COLS = ["Name", "Exempt", "Not available on", "Max per week", "Max per month"]
+DAY_ABBR = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+
+def empty_rules(names: list[str]) -> pd.DataFrame:
+    return pd.DataFrame({"Name": names, "Exempt": False, "Not available on": "",
+                         "Max per week": None, "Max per month": None}, columns=RULE_COLS)
+
+
+def parse_weekdays(text) -> set[int]:
+    """'Mon, Fri' / 'Monday & Wednesday' / 'Tue/Thu' -> {0, 4} etc."""
+    if _is_blank(text):
+        return set()
+    return {DAY_ABBR.index(w) for w in re.findall(r"[A-Za-z]{3}", str(text).lower()) if w in DAY_ABBR}
+
+
+def _truthy(v) -> bool:
+    if _is_blank(v):
+        return False
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in ("y", "yes", "true", "1", "x", "exempt", "✓")
+
+
+def _limit(v) -> int | None:
+    if _is_blank(v) or str(v).strip() == "":
+        return None
+    try:
+        n = int(float(str(v).strip()))
+    except ValueError:
+        return None
+    return n if n >= 0 else None
+
+
+def rules_from_rows(rows: list[list]) -> pd.DataFrame | None:
+    """Read a pasted rules table. Needs a header row with a Name column; other columns are matched by keyword:
+    exempt, not available / unavailable / days off, week, month."""
+    for hi, head in enumerate(rows[:5]):
+        lower = ["" if _is_blank(v) else str(v).lower().strip() for v in head]
+        name_idx = next((i for i, s in enumerate(lower) if NAME_RE.search(s)), -1)
+        if name_idx < 0:
+            continue
+        find = lambda pat: next((i for i, s in enumerate(lower) if i != name_idx and re.search(pat, s)), -1)
+        ex_i = find(r"exempt|excluded?")
+        na_i = find(r"not avail|unavail|days? off|cannot|can't")
+        wk_i = find(r"week")
+        mo_i = find(r"month")
+        out = []
+        for r in rows[hi + 1:]:
+            name = "" if _is_blank(_cell(r, name_idx)) else str(_cell(r, name_idx)).strip()
+            if not name or SKIP_RE.match(name):
+                continue
+            out.append({
+                "Name": name,
+                "Exempt": _truthy(_cell(r, ex_i)),
+                "Not available on": "" if _is_blank(_cell(r, na_i)) else str(_cell(r, na_i)).strip(),
+                "Max per week": _limit(_cell(r, wk_i)),
+                "Max per month": _limit(_cell(r, mo_i)),
+            })
+        if out:
+            return pd.DataFrame(out, columns=RULE_COLS)
+    return None
+
+
+def rules_dict(table: pd.DataFrame) -> dict[str, dict]:
+    """Rules table -> {name: {exempt, off_days, max_week, max_month}}."""
+    out = {}
+    for _, r in table.iterrows():
+        name = "" if _is_blank(r.get("Name")) else str(r["Name"]).strip()
+        if not name:
+            continue
+        out[name] = {
+            "exempt": _truthy(r.get("Exempt")),
+            "off_days": parse_weekdays(r.get("Not available on")),
+            "max_week": _limit(r.get("Max per week")),
+            "max_month": _limit(r.get("Max per month")),
+        }
+    return out
+
+
+def _week(d: dt.date) -> tuple[int, int]:
+    return d.isocalendar()[:2]
 
 
 # ---------- Roster generation ----------
@@ -175,22 +291,41 @@ def workdays(year: int, month: int) -> list[dt.date]:
 
 
 def generate(staff: list[str], leave: dict[str, set[dt.date]], year: int, month: int, seed: int,
-             slots: int = SLOTS) -> pd.DataFrame:
+             slots: int = SLOTS, rules: dict[str, dict] | None = None) -> pd.DataFrame:
     """Fill the given number of duty slots per working day.
 
-    Current placeholder rules:
+    Rules applied:
       1. Nobody is rostered on a leave day.
       2. One slot per person per day.
-      3. People with the fewest duties so far are picked first; slot positions rotate.
-    Add office criteria here (e.g. max duties per week, no consecutive days, seniority per slot).
+      3. Staff rules: exempt staff are never rostered; nobody is rostered on their "not available" weekdays;
+         max duties per week and per month are respected.
+      4. People with the fewest duties so far are picked first; slot positions rotate.
+    Add further office criteria here (e.g. no consecutive days, seniority per slot).
     """
+    rules = rules or {}
+    week_count: dict[tuple, int] = {}
+
+    def eligible(n: str, d: dt.date) -> bool:
+        if d in leave.get(n, set()):
+            return False
+        r = rules.get(n)
+        if not r:
+            return True
+        if r["exempt"] or d.weekday() in r["off_days"]:
+            return False
+        if r["max_month"] is not None and count[n] >= r["max_month"]:
+            return False
+        if r["max_week"] is not None and week_count.get((n, _week(d)), 0) >= r["max_week"]:
+            return False
+        return True
+
     rng = random.Random(seed)
     count = {n: 0 for n in staff}
     cols = slot_cols(slots)
     slot_count = {n: [0] * slots for n in staff}
     records = []
     for d in workdays(year, month):
-        avail = [n for n in staff if d not in leave.get(n, set())]
+        avail = [n for n in staff if eligible(n, d)]
         rng.shuffle(avail)
         avail.sort(key=lambda n: count[n])  # stable, so the shuffle breaks ties fairly
         chosen = avail[:slots]
@@ -203,14 +338,17 @@ def generate(staff: list[str], leave: dict[str, set[dt.date]], year: int, month:
             row[s] = p
             count[p] += 1
             slot_count[p][s] += 1
+            week_count[(p, _week(d))] = week_count.get((p, _week(d)), 0) + 1
         records.append({"Date": d, "Day": d.strftime("%a"), **dict(zip(cols, row))})
     return pd.DataFrame(records, columns=["Date", "Day", *cols])
 
 
 # ---------- Checks ----------
 
-def cell_status(roster: pd.DataFrame, leave: dict[str, set[dt.date]]) -> pd.DataFrame:
-    """Same shape as the slot columns: '', 'empty', 'leave' or 'dup' for each cell."""
+def cell_status(roster: pd.DataFrame, leave: dict[str, set[dt.date]],
+                rules: dict[str, dict] | None = None) -> pd.DataFrame:
+    """Same shape as the slot columns: '', 'empty', 'leave', 'dup', 'exempt' or 'offday' for each cell."""
+    rules = rules or {}
     cols = roster_slot_cols(roster)
     status = pd.DataFrame("", index=roster.index, columns=cols)
     for idx, row in roster.iterrows():
@@ -223,18 +361,48 @@ def cell_status(roster: pd.DataFrame, leave: dict[str, set[dt.date]]) -> pd.Data
                 status.at[idx, c] = "leave"
             elif names.count(p) > 1:
                 status.at[idx, c] = "dup"
+            elif rules.get(p, {}).get("exempt"):
+                status.at[idx, c] = "exempt"
+            elif pd.Timestamp(row["Date"]).weekday() in rules.get(p, {}).get("off_days", set()):
+                status.at[idx, c] = "offday"
     return status
 
 
-def issues_table(roster: pd.DataFrame, status: pd.DataFrame) -> pd.DataFrame:
-    labels = {"empty": "Unfilled slot", "leave": "Rostered while on leave", "dup": "Rostered twice that day"}
+def issues_table(roster: pd.DataFrame, status: pd.DataFrame,
+                 rules: dict[str, dict] | None = None) -> pd.DataFrame:
+    labels = {"empty": "Unfilled slot", "leave": "Rostered while on leave", "dup": "Rostered twice that day",
+              "exempt": "Staff is exempt from duty", "offday": "Not available on this weekday"}
     rows = []
     for idx, row in roster.iterrows():
         for c in roster_slot_cols(roster):
             kind = status.at[idx, c]
             if kind:
                 rows.append({"Date": row["Date"], "Slot": c, "Staff": row[c] or "", "Issue": labels[kind]})
+    rows += limit_breaches(roster, rules or {})
     return pd.DataFrame(rows, columns=["Date", "Slot", "Staff", "Issue"])
+
+
+def limit_breaches(roster: pd.DataFrame, rules: dict[str, dict]) -> list[dict]:
+    """Weekly and monthly maximums exceeded (usually after manual edits)."""
+    cols = roster_slot_cols(roster)
+    month_n: dict[str, int] = {}
+    week_n: dict[tuple, list] = {}
+    for _, row in roster.iterrows():
+        d = pd.Timestamp(row["Date"]).date()
+        for p in {row[c] for c in cols if not _is_blank(row[c]) and row[c] != ""}:
+            month_n[p] = month_n.get(p, 0) + 1
+            week_n.setdefault((p, _week(d)), []).append(d)
+    out = []
+    for p, n in month_n.items():
+        cap = rules.get(p, {}).get("max_month")
+        if cap is not None and n > cap:
+            out.append({"Date": None, "Slot": "", "Staff": p, "Issue": f"{n} duties this month, limit is {cap}"})
+    for (p, _), ds in week_n.items():
+        cap = rules.get(p, {}).get("max_week")
+        if cap is not None and len(ds) > cap:
+            out.append({"Date": min(ds), "Slot": "", "Staff": p,
+                        "Issue": f"{len(ds)} duties in the week of {min(ds):%d %b}, limit is {cap}"})
+    return out
 
 
 def tally(roster: pd.DataFrame, staff: list[str], leave: dict[str, set[dt.date]]) -> pd.DataFrame:
@@ -253,7 +421,7 @@ def tally(roster: pd.DataFrame, staff: list[str], leave: dict[str, set[dt.date]]
 
 # ---------- Excel export ----------
 
-FILLS = {"leave": "FBE6E1", "dup": "FBEFD2", "empty": "EEF1F4"}
+FILLS = {"leave": "FBE6E1", "dup": "FBEFD2", "empty": "EEF1F4", "exempt": "E8E1F5", "offday": "E8E1F5"}
 
 
 def to_excel(roster: pd.DataFrame, status: pd.DataFrame, tally_df: pd.DataFrame,

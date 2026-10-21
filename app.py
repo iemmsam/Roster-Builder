@@ -12,39 +12,72 @@ import roster_engine as eng
 
 st.set_page_config(page_title="Duty Roster Builder", layout="wide")
 
+EXAMPLE_RULES = eng.empty_rules(eng.EXAMPLE_STAFF)
+EXAMPLE_RULES.loc[EXAMPLE_RULES.Name == "Kelvin", "Exempt"] = True
+EXAMPLE_RULES.loc[EXAMPLE_RULES.Name == "Lakshmi", "Not available on"] = "Fri"
+EXAMPLE_RULES.loc[EXAMPLE_RULES.Name == "Marcus", "Max per week"] = 2
+
 # ---------- Session state ----------
 ss = st.session_state
-today = dt.date.today()
 defaults = {
-    "staff": list(eng.EXAMPLE_STAFF),
-    "example": True,
-    "raw_rows": None,
-    "file_name": None,
-    "file_sig": None,
-    "file_error": None,
+    "rules_table": EXAMPLE_RULES.copy(),
+    "example_staff": True,
+    "raw_rows": None,          # leave plan rows, from paste or upload
+    "leave_source": None,      # "Pasted from Excel" or the file name
     "layout": None,
-    "added": 0,
+    "leave_msg": None,         # (kind, text) shown after loading
+    "file_sig": None,
+    "rules_msg": None,
     "seed": 1,
     "sig": None,
     "roster": None,
     "editor_ver": 0,
-    "staff_ver": 0,
+    "rules_ver": 0,
 }
 for k, v in defaults.items():
     ss.setdefault(k, v)
 
+today = dt.date.today()
+next_month = (today.replace(day=1) + dt.timedelta(days=32)).replace(day=1)
 
-def reset_to_example():
-    for k in ("raw_rows", "file_name", "file_sig", "file_error", "layout"):
+
+def plural(n, word):
+    return f"{n} {word}{'' if n == 1 else 's'}"
+
+
+def load_leave(rows, source, year, month):
+    """Store leave rows if they can be read, and add any new names to the staff table."""
+    res = eng.parse_leave(rows, year, month) if rows else None
+    if not res:
+        ss.leave_msg = ("error", f"Couldn't find staff names and leave dates in the {source.lower()}. "
+                                 "Check that you copied the header row too. See the accepted layouts below.")
+        return
+    ss.raw_rows, ss.leave_source, ss.layout = rows, source, res[0]
+    names = list(res[1].keys())
+    table = ss.rules_table
+    if ss.example_staff:
+        table, added = eng.empty_rules(names), len(names)
+        ss.example_staff = False
+    else:
+        new = [n for n in names if n not in set(table["Name"].astype(str))]
+        table = pd.concat([table, eng.empty_rules(new)], ignore_index=True)
+        added = len(new)
+    ss.rules_table = table
+    ss.rules_ver += 1
+    msg = f"Read {plural(len(names), 'staff member')} as a {res[0].lower()}."
+    if added:
+        msg += f" {plural(added, 'name')} added to Staff & rules."
+    ss.leave_msg = ("success", msg)
+
+
+def clear_leave():
+    for k in ("raw_rows", "leave_source", "layout", "leave_msg", "file_sig"):
         ss[k] = None
-    ss.staff, ss.example, ss.added = list(eng.EXAMPLE_STAFF), True, 0
-    ss.staff_ver += 1
 
 
-# ---------- Sidebar: inputs ----------
+# ---------- Sidebar ----------
 with st.sidebar:
-    st.header("1 · Month")
-    next_month = (today.replace(day=1) + dt.timedelta(days=32)).replace(day=1)
+    st.header("Month")
     c1, c2 = st.columns(2)
     year = c1.number_input("Year", min_value=2020, max_value=2100, value=next_month.year, step=1)
     month = c2.selectbox("Month", range(1, 13), index=next_month.month - 1,
@@ -54,64 +87,59 @@ with st.sidebar:
         "Duty slots per day", min_value=1, max_value=eng.MAX_SLOTS, value=eng.SLOTS, step=1,
         help="How many people are on duty each working day. Changing this regenerates the roster.",
     ))
-
-    st.header("2 · Leave plan")
-    up = st.file_uploader("Upload the leave planning Excel", type=["xlsx", "xls", "csv"],
-                          help="The first sheet is read.")
-    if up is not None:
-        sig = (up.name, up.size)
-        if sig != ss.file_sig:
-            ss.file_sig = sig
-            try:
-                rows = eng.read_rows(up.name, up.getvalue())
-                res = eng.parse_leave(rows, year, month)
-            except Exception:
-                rows, res = None, None
-                ss.file_error = f"Couldn't open {up.name}. Make sure it's an Excel or CSV file."
-            if res:
-                ss.raw_rows, ss.file_name, ss.layout, ss.file_error = rows, up.name, res[0], None
-                names = list(res[1].keys())
-                if ss.example:
-                    ss.staff, ss.example, ss.added = names, False, len(names)
-                else:
-                    new = [n for n in names if n not in ss.staff]
-                    ss.staff, ss.added = ss.staff + new, len(new)
-                ss.staff_ver += 1
-            elif rows is not None:
-                ss.file_error = (f"Couldn't find staff names and leave dates in {up.name}. "
-                                 "See the accepted layouts below.")
-
-    if ss.file_error:
-        st.error(ss.file_error)
-    if ss.file_name:
-        st.success(f"**{ss.file_name}** · {ss.layout}")
-        if ss.added:
-            st.caption(f"{ss.added} name{'s' if ss.added > 1 else ''} added to the staff list from this file.")
-        st.button("Clear leave plan and use example data", on_click=reset_to_example)
-    else:
-        st.caption("Example leave is loaded until you upload a file.")
-
-    with st.expander("Accepted layouts"):
-        st.markdown(
-            "**Calendar grid** — one row per staff, names in the first column, dates or day numbers "
-            "across the top. Any text in a cell (AL, MC, L) counts as leave.\n\n"
-            "**List** — columns named *Name*, *Start* and *End*, one row per leave block."
-        )
-
-    st.header("3 · Staff")
-    staff_edit = st.data_editor(
-        pd.DataFrame({"Name": ss.staff}), key=f"staff_{ss.staff_ver}",
-        num_rows="dynamic", hide_index=True, use_container_width=True,
-    )
-    staff = list(dict.fromkeys(
-        str(n).strip() for n in staff_edit["Name"] if n is not None and str(n).strip()
-    ))
-    st.caption("Add a row at the bottom, or select rows and delete them.")
-
     st.divider()
     if st.button("Reshuffle roster", use_container_width=True,
                  help="Generate a different roster that follows the same rules."):
         ss.seed += 1
+    st.caption("Steps: paste the leave plan, check Staff & rules, then review the roster and download it.")
+
+title = f"{calendar.month_name[month]} {year}"
+st.title("Duty Roster Builder")
+st.caption(f"{plural(slots, 'duty slot')} a day · Monday to Friday · {title}")
+banner = st.container()
+summary = st.container()
+
+tab_leave, tab_rules, tab_roster, tab_review, tab_fair = st.tabs(
+    ["Leave plan", "Staff & rules", "Roster", "Review", "Fairness"])
+
+# ---------- Leave plan tab ----------
+with tab_leave:
+    method = st.radio("How do you want to add the leave plan?", ["Paste from Excel", "Upload a file"],
+                      horizontal=True, key="leave_method")
+    if method == "Paste from Excel":
+        st.markdown(
+            "1. In the leave planning Excel, select the whole table, **including the header row** "
+            "with the names and dates.\n"
+            "2. Press **Ctrl+C**.\n"
+            "3. Click in the box below, press **Ctrl+V**, then click **Use this leave plan**."
+        )
+        with st.form("leave_paste", clear_on_submit=False):
+            text = st.text_area("Leave plan cells", height=200, key="leave_text",
+                                placeholder="Name\t1 Nov\t2 Nov\t3 Nov …\nAisyah\t\tAL\tAL …")
+            if st.form_submit_button("Use this leave plan", type="primary"):
+                load_leave(eng.rows_from_paste(text), "Pasted from Excel", year, month)
+    else:
+        up = st.file_uploader("Leave planning Excel", type=["xlsx", "xls", "csv"], help="The first sheet is read.")
+        if up is not None and (up.name, up.size) != ss.file_sig:
+            ss.file_sig = (up.name, up.size)
+            try:
+                load_leave(eng.read_rows(up.name, up.getvalue()), up.name, year, month)
+            except Exception:
+                ss.leave_msg = ("error", f"Couldn't open {up.name}. Make sure it's an Excel or CSV file.")
+
+    if ss.leave_msg:
+        getattr(st, ss.leave_msg[0])(ss.leave_msg[1])
+    if ss.raw_rows is None:
+        st.info("Example leave is in use until you add your leave plan.")
+
+    with st.expander("Accepted layouts"):
+        st.markdown(
+            "**Calendar grid**: one row per staff, names in the first column, dates or day numbers across "
+            "the top (1, 2, 3 … or 1-Nov, Mon 3, 03/11/2026). Any text in a cell (AL, MC, L) counts as leave. "
+            "Extra header rows such as weekday names are fine.\n\n"
+            "**List**: columns named *Name*, *Start* and *End* (or From/To), one row per leave block.\n\n"
+            "Day numbers on their own are read as days of the month chosen in the sidebar."
+        )
 
 # ---------- Leave for the chosen month ----------
 if ss.raw_rows is not None:
@@ -120,32 +148,75 @@ if ss.raw_rows is not None:
 else:
     leave = eng.example_leave(year, month)
 
+# ---------- Staff & rules tab ----------
+with tab_rules:
+    st.markdown("Each row is one staff member. Leave a cell blank if the rule doesn't apply to that person. "
+                "You can type in the table, or paste a rules table from Excel.")
+    with st.expander("Paste rules from Excel"):
+        st.markdown(
+            "Copy a table with a header row. The **Name** column is required. Other columns are matched by "
+            "their header: *Exempt* (Y/N), *Not available on* (e.g. Fri, or Mon, Wed), *Max per week*, "
+            "*Max per month*. Pasting updates the people listed and adds anyone new; others keep their rules."
+        )
+        with st.form("rules_paste"):
+            rtext = st.text_area("Rules cells", height=160, key="rules_text",
+                                 placeholder="Name\tExempt\tNot available on\tMax per week\tMax per month\n"
+                                             "Aisyah\t\tFri\t2\t")
+            if st.form_submit_button("Use these rules", type="primary"):
+                table = eng.rules_from_rows(eng.rows_from_paste(rtext))
+                if table is None:
+                    ss.rules_msg = ("error", "Couldn't find a Name column. Copy the header row together with "
+                                             "the rows below it.")
+                else:
+                    keep = ss.rules_table if not ss.example_staff else eng.empty_rules([])
+                    keep = keep[~keep["Name"].astype(str).isin(set(table["Name"]))]
+                    ss.rules_table = pd.concat([keep, table], ignore_index=True)
+                    ss.example_staff = False
+                    ss.rules_ver += 1
+                    ss.rules_msg = ("success", f"Loaded rules for {plural(len(table), 'staff member')}. "
+                                               f"The table now has {plural(len(ss.rules_table), 'staff member')}.")
+    if ss.rules_msg:
+        getattr(st, ss.rules_msg[0])(ss.rules_msg[1])
+    if ss.example_staff:
+        st.info("These are **example** staff. Paste your leave plan or rules to replace them.")
+
+    rules_edit = st.data_editor(
+        ss.rules_table, key=f"rules_{ss.rules_ver}", num_rows="dynamic", hide_index=True,
+        use_container_width=True,
+        column_config={
+            "Name": st.column_config.TextColumn("Name", required=True),
+            "Exempt": st.column_config.CheckboxColumn("Exempt", help="Never rostered", default=False),
+            "Not available on": st.column_config.TextColumn(
+                "Not available on", help="Weekdays this person can't do duty, e.g. Fri or Mon, Wed"),
+            "Max per week": st.column_config.NumberColumn("Max per week", min_value=0, step=1, format="%d"),
+            "Max per month": st.column_config.NumberColumn("Max per month", min_value=0, step=1, format="%d"),
+        },
+    )
+    rules_edit = rules_edit[rules_edit["Name"].notna() & (rules_edit["Name"].astype(str).str.strip() != "")]
+    rules_edit = rules_edit.assign(Name=rules_edit["Name"].astype(str).str.strip()).drop_duplicates("Name")
+    staff = list(rules_edit["Name"])
+    rules = eng.rules_dict(rules_edit)
+
+    bad = [f"{n} ({r['Not available on']})" for _, r in rules_edit.iterrows()
+           if (n := r["Name"]) and not eng._is_blank(r["Not available on"])
+           and str(r["Not available on"]).strip() and not rules[n]["off_days"]]
+    if bad:
+        st.warning("Couldn't read the weekday for: " + ", ".join(bad) + ". Use Mon, Tue, Wed, Thu or Fri.")
+
 # ---------- Generate when inputs change ----------
 sig = (tuple(staff), year, month, slots, ss.seed,
-       tuple(sorted((n, tuple(sorted(ds))) for n, ds in leave.items())))
+       tuple(sorted((n, tuple(sorted(ds))) for n, ds in leave.items())),
+       tuple(sorted((n, r["exempt"], tuple(sorted(r["off_days"])), r["max_week"], r["max_month"])
+                    for n, r in rules.items())))
 if sig != ss.sig:
-    ss.roster = eng.generate(staff, leave, year, month, ss.seed, slots)
+    ss.roster = eng.generate(staff, leave, year, month, ss.seed, slots, rules)
     ss.sig = sig
     ss.editor_ver += 1
 
-# ---------- Main page ----------
-title = f"{calendar.month_name[month]} {year}"
-st.title("Duty Roster Builder")
-st.caption(f"{slots} duty slot{'s' if slots != 1 else ''} a day · Monday to Friday")
-if len(staff) < slots:
-    st.warning(f"There are {len(staff)} staff for {slots} slots a day, so some slots will stay unfilled. "
-               "Add staff or reduce the slots per day.")
-if ss.example:
-    st.info("You're looking at **example** staff and leave. Upload the leave plan in the sidebar to use your own.")
-
-summary = st.container()
-
-tab_roster, tab_review, tab_fair, tab_leave = st.tabs(["Roster", "Review", "Fairness", "Leave file"])
-
+# ---------- Roster tab ----------
 with tab_roster:
-    st.subheader(title)
-    st.caption("Click any slot to swap someone in. Changing staff, leave or month regenerates the roster "
-               "and replaces manual edits.")
+    st.caption("Click any slot to swap someone in. Changing leave, staff, rules, month or slots regenerates "
+               "the roster and replaces manual edits.")
     edited = st.data_editor(
         ss.roster, key=f"roster_{ss.editor_ver}", hide_index=True, use_container_width=True,
         disabled=["Date", "Day"], height=min(38 * (len(ss.roster) + 1) + 3, 900),
@@ -156,11 +227,19 @@ with tab_roster:
         },
     )
 
-status = eng.cell_status(edited, leave)
-issues = eng.issues_table(edited, status)
+status = eng.cell_status(edited, leave, rules)
+issues = eng.issues_table(edited, status, rules)
 tally = eng.tally(edited, staff, leave)
 n_empty = int((status == "empty").sum().sum())
-n_conf = int(status.isin(["leave", "dup"]).sum().sum())
+n_conf = len(issues) - n_empty
+
+with banner:
+    on_duty = sum(1 for n in staff if not rules.get(n, {}).get("exempt"))
+    if on_duty < slots:
+        st.warning(f"{plural(on_duty, 'staff member')} can do duty for {plural(slots, 'slot')} a day, so some "
+                   "slots will stay unfilled. Add staff or reduce the slots per day.")
+    if ss.example_staff or ss.raw_rows is None:
+        st.info("Some **example** data is in use. Add your leave plan and staff rules in the first two tabs.")
 
 with summary:
     m1, m2, m3, m4, m5 = st.columns([1, 1, 1, 1, 1.4])
@@ -175,44 +254,55 @@ with summary:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
+# ---------- Review tab ----------
 with tab_review:
     css_map = {"leave": "background-color:#FBE6E1;color:#8A2A1A;font-weight:600",
                "dup": "background-color:#FBEFD2;color:#6E4B00;font-weight:600",
+               "exempt": "background-color:#E8E1F5;color:#4B2E83;font-weight:600",
+               "offday": "background-color:#E8E1F5;color:#4B2E83;font-weight:600",
                "empty": "background-color:#EEF1F4", "": ""}
+
     def _styles(df):
         out = pd.DataFrame("", index=df.index, columns=df.columns)
         cols = list(status.columns)
         out[cols] = status[cols].apply(lambda col: col.map(css_map))
         return out
+
     view = edited.copy()
     view["Date"] = pd.to_datetime(view["Date"]).dt.strftime("%d %b")
     st.dataframe(view.fillna("").style.apply(_styles, axis=None), hide_index=True, use_container_width=True,
                  height=min(38 * (len(view) + 1) + 3, 900))
-    st.caption("Red: rostered while on leave · Amber: rostered twice that day · Grey: unfilled")
+    st.caption("Red: on leave · Amber: rostered twice that day · Purple: breaks a staff rule · Grey: unfilled")
     if len(issues):
         st.dataframe(issues, hide_index=True, use_container_width=True,
                      column_config={"Date": st.column_config.DateColumn(format="DD MMM YYYY")})
     else:
-        st.success("No issues. Every slot is filled and nobody is rostered on leave.")
+        st.success("No issues. Every slot is filled and every rule is met.")
 
+# ---------- Fairness tab ----------
 with tab_fair:
-    top = int(tally["Duties"].max()) if len(tally) else 1
-    st.dataframe(tally, hide_index=True, use_container_width=True, column_config={
+    t = tally.merge(rules_edit[["Name", "Max per week", "Max per month"]].rename(columns={"Name": "Staff"}),
+                    on="Staff", how="left")
+    top = int(t["Duties"].max()) if len(t) else 1
+    st.dataframe(t, hide_index=True, use_container_width=True, column_config={
         "Duties": st.column_config.ProgressColumn("Duties", min_value=0, max_value=max(top, 1), format="%d"),
+        "Max per week": st.column_config.NumberColumn(format="%d"),
+        "Max per month": st.column_config.NumberColumn(format="%d"),
     })
-    if len(tally):
-        st.caption(f"Duties range from {int(tally['Duties'].min())} to {top} per person this month.")
+    pool = t[~t["Staff"].map(lambda n: rules.get(n, {}).get("exempt", False))]
+    if len(pool):
+        st.caption(f"Among staff who do duty, duties range from {int(pool['Duties'].min())} to "
+                   f"{int(pool['Duties'].max())} this month.")
 
+# ---------- Leave plan tab: what was read ----------
 with tab_leave:
-    lv = pd.DataFrame(
-        [{"Staff": n, "Leave days this month": sum(1 for d in ds if d.year == year and d.month == month)}
-         for n, ds in leave.items()]
-    )
     if ss.raw_rows is not None:
-        st.markdown(f"**{ss.file_name}** read as **{ss.layout}**. First rows of the file:")
-        raw = pd.DataFrame(ss.raw_rows[:10]).fillna("").astype(str)
-        st.dataframe(raw, use_container_width=True)
-    else:
-        st.markdown("Example leave (no file uploaded):")
+        st.markdown(f"**{ss.leave_source}**, read as **{ss.layout}**. First rows:")
+        st.dataframe(pd.DataFrame(ss.raw_rows[:8]).fillna("").astype(str), use_container_width=True)
+        st.button("Clear leave plan", on_click=clear_leave)
+    lv = pd.DataFrame([{"Staff": n, f"Leave days in {calendar.month_abbr[month]}":
+                        sum(1 for d in ds if d.year == year and d.month == month)} for n, ds in leave.items()])
     if len(lv):
-        st.dataframe(lv[lv["Leave days this month"] > 0], hide_index=True, use_container_width=True)
+        lv = lv[lv.iloc[:, 1] > 0]
+        st.markdown("**Leave this month**" + ("" if ss.raw_rows is not None else " (example)"))
+        st.dataframe(lv, hide_index=True, use_container_width=True)

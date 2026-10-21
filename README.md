@@ -1,6 +1,7 @@
 # Duty Roster Builder
 
-Generates a monthly office duty roster: a set number of slots a day (8 by default, changeable in the sidebar), Monday to Friday, built around the staff leave plan.
+Generates a monthly office duty roster, Monday to Friday, built around the staff leave plan. Each duty post
+(MSW 1, MSW 2, MSW 7, MSW 8 by default) has an AM and a PM slot, so 8 slots a day. Posts can be changed in the sidebar.
 
 ## Files
 
@@ -58,10 +59,16 @@ Blank cells mean no limit. Pasting updates the people listed and adds anyone new
 
 ## Rules the roster follows
 
-1. Nobody is rostered on a leave day.
-2. One slot per person per day.
-3. Exempt staff, "not available" weekdays, and weekly and monthly maximums are respected.
-4. Duties are spread evenly, and slot positions rotate.
+1. Nobody is rostered on a leave day or a public holiday.
+2. Nobody takes two slots in the same half-day (AM or PM).
+3. One person may take an AM and a PM slot on the same day. The sidebar setting decides when:
+   - **Only when short of staff** (default): everyone available gets one slot first; people double up only
+     to fill slots that would otherwise be empty.
+   - **Allowed on any day**: doubling up is allowed whenever that person is the fairest pick.
+   - **Never**: one slot per person per day; short days keep unfilled slots.
+4. Exempt staff, "not available" weekdays, and weekly and monthly maximums are respected
+   (an AM + PM day counts as 2 duties).
+5. Duties are spread evenly, and slot positions rotate.
 
 More criteria go in `generate()` in `roster_engine.py`.
 

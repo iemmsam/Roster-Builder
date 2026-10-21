@@ -11,20 +11,39 @@ import re
 
 import pandas as pd
 
-SLOTS = 8  # default; the app lets the user change it
-MAX_SLOTS = 30
+SESSIONS = ("AM", "PM")
+DEFAULT_POSTS = ["MSW 1", "MSW 2", "MSW 7", "MSW 8"]   # each post has an AM and a PM slot
+SLOTS = len(SESSIONS) * len(DEFAULT_POSTS)
+
+# Can one person take an AM and a PM slot on the same day? (Never two slots in the same half-day.)
+DOUBLE_MODES = {
+    "short": "Only when short of staff",
+    "any": "Allowed on any day",
+    "never": "Never",
+}
 
 
-def slot_cols(n: int) -> list[str]:
-    return [f"Slot {i + 1}" for i in range(n)]
+def parse_posts(text) -> list[str]:
+    """'MSW 1, MSW 2, MSW 7, MSW 8' -> ['MSW 1', 'MSW 2', 'MSW 7', 'MSW 8']."""
+    posts = [p.strip() for p in re.split(r"[,;\n]", str(text or "")) if p.strip()]
+    return list(dict.fromkeys(posts)) or list(DEFAULT_POSTS)
+
+
+def slot_cols(posts: list[str] | None = None) -> list[str]:
+    posts = posts or DEFAULT_POSTS
+    return [f"{sess} {p}" for sess in SESSIONS for p in posts]
 
 
 def roster_slot_cols(roster: pd.DataFrame) -> list[str]:
     """Slot columns present in a roster, in order."""
-    return [c for c in roster.columns if str(c).startswith("Slot ")]
+    return [c for c in roster.columns if c not in ("Date", "Day")]
 
 
-SLOT_COLS = slot_cols(SLOTS)
+def session_of(col: str) -> str:
+    return str(col).split(" ", 1)[0]
+
+
+SLOT_COLS = slot_cols()
 MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
 NAME_RE = re.compile(r"name|staff|officer|employee", re.I)
 SKIP_RE = re.compile(r"^(day|days|date|dates|name|staff|total)$|^(total|daily|staff strength|attendance|sub-?total)\b",
@@ -341,19 +360,27 @@ def workdays(year: int, month: int, holidays: set[dt.date] | None = None) -> lis
 
 
 def generate(staff: list[str], leave: dict[str, set[dt.date]], year: int, month: int, seed: int,
-             slots: int = SLOTS, rules: dict[str, dict] | None = None,
-             holidays: set[dt.date] | None = None) -> pd.DataFrame:
-    """Fill the given number of duty slots per working day.
+             posts: list[str] | None = None, rules: dict[str, dict] | None = None,
+             holidays: set[dt.date] | None = None, double: str = "short") -> pd.DataFrame:
+    """Fill the AM and PM slot of every post on each working day.
 
     Rules applied:
-      1. Nobody is rostered on a leave day.
-      2. One slot per person per day.
-      3. Staff rules: exempt staff are never rostered; nobody is rostered on their "not available" weekdays;
-         max duties per week and per month are respected.
-      4. People with the fewest duties so far are picked first; slot positions rotate.
+      1. Nobody is rostered on a leave day or a public holiday.
+      2. Nobody takes two slots in the same half-day (AM or PM).
+      3. A second slot on the same day (one AM + one PM) depends on `double`:
+         "short" = only to fill slots left empty once everyone available has one slot,
+         "any"   = allowed whenever that person is the fairest pick,
+         "never" = one slot per person per day.
+      4. Staff rules: exempt staff are never rostered; nobody is rostered on their "not available" weekdays;
+         max duties per week and per month are respected (an AM + PM day counts as 2 duties).
+      5. People with the fewest duties so far are picked first; slot positions rotate.
     Add further office criteria here (e.g. no consecutive days, seniority per slot).
     """
     rules = rules or {}
+    cols = slot_cols(posts)
+    rng = random.Random(seed)
+    count = {n: 0 for n in staff}
+    slot_count = {n: [0] * len(cols) for n in staff}
     week_count: dict[tuple, int] = {}
 
     def eligible(n: str, d: dt.date) -> bool:
@@ -370,26 +397,46 @@ def generate(staff: list[str], leave: dict[str, set[dt.date]], year: int, month:
             return False
         return True
 
-    rng = random.Random(seed)
-    count = {n: 0 for n in staff}
-    cols = slot_cols(slots)
-    slot_count = {n: [0] * slots for n in staff}
+    def assign(row, s, p, d, today):
+        row[s] = p
+        today.setdefault(p, set()).add(session_of(cols[s]))
+        count[p] += 1
+        slot_count[p][s] += 1
+        week_count[(p, _week(d))] = week_count.get((p, _week(d)), 0) + 1
+
     records = []
     for d in workdays(year, month, holidays):
+        row = [None] * len(cols)
+        today: dict[str, set[str]] = {}          # person -> sessions already worked today
         avail = [n for n in staff if eligible(n, d)]
-        rng.shuffle(avail)
-        avail.sort(key=lambda n: count[n])  # stable, so the shuffle breaks ties fairly
-        chosen = avail[:slots]
-        row = [None] * slots
-        for s in range(slots):
-            if not chosen:
-                break
-            chosen.sort(key=lambda n: slot_count[n][s])
-            p = chosen.pop(0)
-            row[s] = p
-            count[p] += 1
-            slot_count[p][s] += 1
-            week_count[(p, _week(d))] = week_count.get((p, _week(d)), 0) + 1
+        rng.shuffle(avail)                        # random tie-break, then fairness
+        avail.sort(key=lambda n: count[n])
+
+        if double == "any":
+            for s, col in enumerate(cols):
+                sess = session_of(col)
+                cands = [n for n in avail if sess not in today.get(n, set()) and eligible(n, d)]
+                if cands:
+                    cands.sort(key=lambda n: (count[n], slot_count[n][s]))
+                    assign(row, s, cands[0], d, today)
+        else:
+            # Pass 1: everyone available gets at most one slot, fairest first, positions rotated.
+            chosen = avail[:len(cols)]
+            for s in range(len(cols)):
+                if not chosen:
+                    break
+                chosen.sort(key=lambda n: slot_count[n][s])
+                assign(row, s, chosen.pop(0), d, today)
+            # Pass 2: still short, so let someone already on duty take the other half-day.
+            if double == "short":
+                for s, col in enumerate(cols):
+                    if row[s] is not None:
+                        continue
+                    sess = session_of(col)
+                    cands = [n for n in today if sess not in today[n] and eligible(n, d)]
+                    if cands:
+                        cands.sort(key=lambda n: (count[n], slot_count[n][s]))
+                        assign(row, s, cands[0], d, today)
         records.append({"Date": d, "Day": d.strftime("%a"), **dict(zip(cols, row))})
     return pd.DataFrame(records, columns=["Date", "Day", *cols])
 
@@ -397,37 +444,43 @@ def generate(staff: list[str], leave: dict[str, set[dt.date]], year: int, month:
 # ---------- Checks ----------
 
 def cell_status(roster: pd.DataFrame, leave: dict[str, set[dt.date]],
-                rules: dict[str, dict] | None = None) -> pd.DataFrame:
-    """Same shape as the slot columns: '', 'empty', 'leave', 'dup', 'exempt' or 'offday' for each cell."""
+                rules: dict[str, dict] | None = None, double: str = "short") -> pd.DataFrame:
+    """Same shape as the slot columns, one code per cell:
+    '' ok, 'empty', 'leave', 'dup' (twice in one half-day, or AM + PM when not allowed),
+    'exempt', 'offday', or 'double' (AM + PM on the same day, allowed; shown for information)."""
     rules = rules or {}
     cols = roster_slot_cols(roster)
     status = pd.DataFrame("", index=roster.index, columns=cols)
     for idx, row in roster.iterrows():
+        by_sess = {sess: [row[c] for c in cols if session_of(c) == sess] for sess in SESSIONS}
         names = [row[c] for c in cols]
         for c in cols:
             p = row[c]
             if _is_blank(p) or p == "":
                 status.at[idx, c] = "empty"
-            elif row["Date"] in leave.get(p, set()):
+            elif pd.Timestamp(row["Date"]).date() in leave.get(p, set()):
                 status.at[idx, c] = "leave"
-            elif names.count(p) > 1:
+            elif by_sess.get(session_of(c), []).count(p) > 1 or (double == "never" and names.count(p) > 1):
                 status.at[idx, c] = "dup"
             elif rules.get(p, {}).get("exempt"):
                 status.at[idx, c] = "exempt"
             elif pd.Timestamp(row["Date"]).weekday() in rules.get(p, {}).get("off_days", set()):
                 status.at[idx, c] = "offday"
+            elif names.count(p) > 1:
+                status.at[idx, c] = "double"
     return status
 
 
 def issues_table(roster: pd.DataFrame, status: pd.DataFrame,
                  rules: dict[str, dict] | None = None) -> pd.DataFrame:
-    labels = {"empty": "Unfilled slot", "leave": "Rostered while on leave", "dup": "Rostered twice that day",
+    labels = {"empty": "Unfilled slot", "leave": "Rostered while on leave",
+              "dup": "Two slots in the same half-day, or AM + PM when not allowed",
               "exempt": "Staff is exempt from duty", "offday": "Not available on this weekday"}
     rows = []
     for idx, row in roster.iterrows():
         for c in roster_slot_cols(roster):
             kind = status.at[idx, c]
-            if kind:
+            if kind and kind != "double":
                 rows.append({"Date": row["Date"], "Slot": c, "Staff": row[c] or "", "Issue": labels[kind]})
     rows += limit_breaches(roster, rules or {})
     return pd.DataFrame(rows, columns=["Date", "Slot", "Staff", "Issue"])
@@ -463,16 +516,30 @@ def tally(roster: pd.DataFrame, staff: list[str], leave: dict[str, set[dt.date]]
         for p in roster[c]:
             if not _is_blank(p) and p != "":
                 counts[p] = counts.get(p, 0) + 1
+    cols = roster_slot_cols(roster)
+    am = {n: 0 for n in counts}
+    doubles = {n: 0 for n in counts}
+    for _, row in roster.iterrows():
+        names = [row[c] for c in cols if not _is_blank(row[c]) and row[c] != ""]
+        for c in cols:
+            p = row[c]
+            if not _is_blank(p) and p != "" and session_of(c) == "AM":
+                am[p] = am.get(p, 0) + 1
+        for p in set(names):
+            if names.count(p) > 1:
+                doubles[p] = doubles.get(p, 0) + 1
     rows = []
     for n, c in counts.items():
-        lv = sum(1 for d in days if d in leave.get(n, set()))
-        rows.append({"Staff": n, "Duties": c, "Leave days": lv, "Days available": len(days) - lv})
+        lv = sum(1 for d in days if pd.Timestamp(d).date() in leave.get(n, set()))
+        rows.append({"Staff": n, "Duties": c, "AM": am.get(n, 0), "PM": c - am.get(n, 0),
+                     "AM + PM days": doubles.get(n, 0), "Leave days": lv, "Days available": len(days) - lv})
     return pd.DataFrame(rows).sort_values(["Duties", "Staff"], ascending=[False, True]).reset_index(drop=True)
 
 
 # ---------- Excel export ----------
 
-FILLS = {"leave": "FBE6E1", "dup": "FBEFD2", "empty": "EEF1F4", "exempt": "E8E1F5", "offday": "E8E1F5"}
+FILLS = {"leave": "FBE6E1", "dup": "FBEFD2", "empty": "EEF1F4", "exempt": "E8E1F5", "offday": "E8E1F5",
+         "double": "E1EEF8"}
 
 
 def to_excel(roster: pd.DataFrame, status: pd.DataFrame, tally_df: pd.DataFrame,

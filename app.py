@@ -105,10 +105,21 @@ with st.sidebar:
     year = c1.number_input("Year", min_value=2020, max_value=2100, step=1, key="year_in")
     month = c2.selectbox("Month", range(1, 13), key="month_in", format_func=lambda m: calendar.month_abbr[m])
     year, month = int(year), int(month)
-    slots = int(st.number_input(
-        "Duty slots per day", min_value=1, max_value=eng.MAX_SLOTS, value=eng.SLOTS, step=1,
-        help="How many people are on duty each working day. Changing this regenerates the roster.",
+    st.header("Duty slots")
+    posts = eng.parse_posts(st.text_input(
+        "Duty posts", value=", ".join(eng.DEFAULT_POSTS), key="posts_in",
+        help="Separate posts with commas. Each post has an AM and a PM slot.",
     ))
+    slots = len(eng.slot_cols(posts))
+    st.caption(f"{plural(len(posts), 'post')} × AM and PM = {plural(slots, 'slot')} a day")
+    double = st.selectbox(
+        "Same person in an AM and a PM slot", list(eng.DOUBLE_MODES), format_func=eng.DOUBLE_MODES.get,
+        key="double_in",
+        help="Nobody is ever given two slots in the same half-day. This sets when someone may do both AM and PM "
+             "on one day. 'Only when short of staff' gives everyone available one slot first, then doubles "
+             "people up to fill what's left.",
+    )
+    per_session = len(posts)
     st.divider()
     if st.button("Reshuffle roster", use_container_width=True,
                  help="Generate a different roster that follows the same rules."):
@@ -117,7 +128,7 @@ with st.sidebar:
 
 title = f"{calendar.month_name[month]} {year}"
 st.title("Duty Roster Builder")
-st.caption(f"{plural(slots, 'duty slot')} a day · Monday to Friday · {title}")
+st.caption(f"AM and PM · {', '.join(posts)} · {plural(slots, 'slot')} a day · Monday to Friday · {title}")
 banner = st.container()
 summary = st.container()
 
@@ -240,51 +251,58 @@ with tab_rules:
         st.warning("Couldn't read the weekday for: " + ", ".join(bad) + ". Use Mon, Tue, Wed, Thu or Fri.")
 
 # ---------- Generate when inputs change ----------
-sig = (tuple(staff), year, month, slots, ss.seed, tuple(sorted(holidays)),
+sig = (tuple(staff), year, month, tuple(posts), double, ss.seed, tuple(sorted(holidays)),
        tuple(sorted((n, tuple(sorted(ds))) for n, ds in leave.items())),
        tuple(sorted((n, r["exempt"], tuple(sorted(r["off_days"])), r["max_week"], r["max_month"])
                     for n, r in rules.items())))
 if sig != ss.sig:
-    ss.roster = eng.generate(staff, leave, year, month, ss.seed, slots, rules, holidays)
+    ss.roster = eng.generate(staff, leave, year, month, ss.seed, posts, rules, holidays, double)
     ss.sig = sig
     ss.editor_ver += 1
 
 # ---------- Roster tab ----------
 with tab_roster:
-    st.caption("Click any slot to swap someone in. Changing leave, staff, rules, month or slots regenerates "
-               "the roster and replaces manual edits.")
+    st.caption("Click any slot to swap someone in. Changing leave, staff, rules, month or duty slots "
+               "regenerates the roster and replaces manual edits.")
     edited = st.data_editor(
         ss.roster, key=f"roster_{ss.editor_ver}", hide_index=True, use_container_width=True,
         disabled=["Date", "Day"], height=min(38 * (len(ss.roster) + 1) + 3, 900),
         column_config={
             "Date": st.column_config.DateColumn("Date", format="DD MMM", width="small"),
             "Day": st.column_config.TextColumn("Day", width="small"),
-            **{c: st.column_config.SelectboxColumn(c, options=staff, required=False) for c in eng.slot_cols(slots)},
+            **{c: st.column_config.SelectboxColumn(c, options=staff, required=False) for c in eng.slot_cols(posts)},
         },
     )
 
-status = eng.cell_status(edited, leave, rules)
+status = eng.cell_status(edited, leave, rules, double)
 issues = eng.issues_table(edited, status, rules)
 tally = eng.tally(edited, staff, leave)
 n_empty = int((status == "empty").sum().sum())
 n_conf = len(issues) - n_empty
 
 with banner:
+    # Fewest people who can cover every slot: one per slot, or one per post when AM + PM doubling is allowed.
+    need = slots if double == "never" else per_session
     on_duty = sum(1 for n in staff if not rules.get(n, {}).get("exempt"))
-    if on_duty < slots:
+    if on_duty < need:
         st.warning(f"{plural(on_duty, 'staff member')} can do duty for {plural(slots, 'slot')} a day, so some "
-                   "slots will stay unfilled. Add staff or reduce the slots per day.")
+                   "slots will stay unfilled. Add staff or remove a post.")
     else:
-        short = []
+        short, doubled = [], []
         for d in edited["Date"]:
             d = pd.Timestamp(d).date()
             n = sum(1 for p in staff if d not in leave.get(p, set()) and not rules.get(p, {}).get("exempt")
                     and d.weekday() not in rules.get(p, {}).get("off_days", set()))
-            if n < slots:
+            if n < need:
                 short.append(f"{d:%-d %b} ({n})")
+            elif double == "short" and n < slots:
+                doubled.append(f"{d:%-d %b} ({n})")
         if short:
-            st.warning(f"Fewer than {slots} staff are available on {plural(len(short), 'day')}, so those days "
-                       "will have unfilled slots: " + ", ".join(short) + ".")
+            st.warning(f"Too few staff are available on {plural(len(short), 'day')} to fill every slot, so those "
+                       "days have unfilled slots: " + ", ".join(short) + ".")
+        if doubled:
+            st.caption(f"Fewer than {slots} staff are in on {plural(len(doubled), 'day')}, so some people do both "
+                       "AM and PM: " + ", ".join(doubled) + ".")
     if holidays:
         st.caption("No duty on public holidays: " + ", ".join(f"{d:%-d %b}" for d in sorted(holidays)) + ".")
     if ss.example_staff or ss.raw_rows is None:
@@ -309,6 +327,7 @@ with tab_review:
                "dup": "background-color:#FBEFD2;color:#6E4B00;font-weight:600",
                "exempt": "background-color:#E8E1F5;color:#4B2E83;font-weight:600",
                "offday": "background-color:#E8E1F5;color:#4B2E83;font-weight:600",
+               "double": "background-color:#E1EEF8;color:#16466E",
                "empty": "background-color:#EEF1F4", "": ""}
 
     def _styles(df):
@@ -321,7 +340,8 @@ with tab_review:
     view["Date"] = pd.to_datetime(view["Date"]).dt.strftime("%d %b")
     st.dataframe(view.fillna("").style.apply(_styles, axis=None), hide_index=True, use_container_width=True,
                  height=min(38 * (len(view) + 1) + 3, 900))
-    st.caption("Red: on leave · Amber: rostered twice that day · Purple: breaks a staff rule · Grey: unfilled")
+    st.caption("Blue: does both AM and PM that day · Red: on leave · Amber: two slots in the same half-day "
+               "(or AM + PM when not allowed) · Purple: breaks a staff rule · Grey: unfilled")
     if len(issues):
         st.dataframe(issues, hide_index=True, use_container_width=True,
                      column_config={"Date": st.column_config.DateColumn(format="DD MMM YYYY")})

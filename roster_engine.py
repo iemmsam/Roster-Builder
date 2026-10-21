@@ -361,7 +361,8 @@ def workdays(year: int, month: int, holidays: set[dt.date] | None = None) -> lis
 
 def generate(staff: list[str], leave: dict[str, set[dt.date]], year: int, month: int, seed: int,
              posts: list[str] | None = None, rules: dict[str, dict] | None = None,
-             holidays: set[dt.date] | None = None, double: str = "short") -> pd.DataFrame:
+             holidays: set[dt.date] | None = None, double: str = "short",
+             weekly: bool = True) -> pd.DataFrame:
     """Fill the AM and PM slot of every post on each working day.
 
     Rules applied:
@@ -373,8 +374,10 @@ def generate(staff: list[str], leave: dict[str, set[dt.date]], year: int, month:
          "never" = one slot per person per day.
       4. Staff rules: exempt staff are never rostered; nobody is rostered on their "not available" weekdays;
          max duties per week and per month are respected (an AM + PM day counts as 2 duties).
-      5. People with the fewest duties so far are picked first; slot positions rotate.
-    Add further office criteria here (e.g. no consecutive days, seniority per slot).
+      5. Weekly pattern (`weekly`): each weekday has a fixed line-up, so whoever has a slot on the first Monday
+         has it every Monday. When they're away, someone else covers that day only.
+      6. People with the fewest duties so far are picked first; slot positions rotate.
+    The returned frame carries attrs["covers"]: how many slots were filled by someone outside the pattern.
     """
     rules = rules or {}
     cols = slot_cols(posts)
@@ -382,18 +385,22 @@ def generate(staff: list[str], leave: dict[str, set[dt.date]], year: int, month:
     count = {n: 0 for n in staff}
     slot_count = {n: [0] * len(cols) for n in staff}
     week_count: dict[tuple, int] = {}
+    days = workdays(year, month, holidays)
 
-    def eligible(n: str, d: dt.date) -> bool:
+    def can_work(n: str, d: dt.date) -> bool:
+        """Leave, exemption and unavailable weekdays (no duty-count limits)."""
         if d in leave.get(n, set()):
             return False
         r = rules.get(n)
-        if not r:
-            return True
-        if r["exempt"] or d.weekday() in r["off_days"]:
+        return not (r and (r["exempt"] or d.weekday() in r["off_days"]))
+
+    def eligible(n: str, d: dt.date) -> bool:
+        if not can_work(n, d):
             return False
-        if r["max_month"] is not None and count[n] >= r["max_month"]:
+        r = rules.get(n)
+        if r and r["max_month"] is not None and count[n] >= r["max_month"]:
             return False
-        if r["max_week"] is not None and week_count.get((n, _week(d)), 0) >= r["max_week"]:
+        if r and r["max_week"] is not None and week_count.get((n, _week(d)), 0) >= r["max_week"]:
             return False
         return True
 
@@ -404,41 +411,81 @@ def generate(staff: list[str], leave: dict[str, set[dt.date]], year: int, month:
         slot_count[p][s] += 1
         week_count[(p, _week(d))] = week_count.get((p, _week(d)), 0) + 1
 
+    # ---- Weekly pattern: one line-up per weekday, balanced by expected duties ----
+    pattern: dict[int, list[str | None]] = {}
+    if weekly:
+        expected = {n: 0 for n in staff}
+        pat_slot = {n: [0] * len(cols) for n in staff}
+        for wd in range(5):
+            wd_days = [d for d in days if d.weekday() == wd]
+            if not wd_days:
+                continue
+            avail = {n: sum(can_work(n, d) for d in wd_days) for n in staff}
+            pool = [n for n in staff if avail[n] > 0]
+            rng.shuffle(pool)
+            # fewest expected duties first; among equals, the person who is in most often on this weekday
+            pool.sort(key=lambda n: (expected[n], -avail[n]))
+            chosen = pool[:len(cols)]
+            line = [None] * len(cols)
+            for s in range(len(cols)):
+                if not chosen:
+                    break
+                chosen.sort(key=lambda n: pat_slot[n][s])
+                p = chosen.pop(0)
+                line[s] = p
+                pat_slot[p][s] += 1
+                expected[p] += avail[p]
+            pattern[wd] = line
+
+    covers = 0
     records = []
-    for d in workdays(year, month, holidays):
+    for d in days:
         row = [None] * len(cols)
         today: dict[str, set[str]] = {}          # person -> sessions already worked today
-        avail = [n for n in staff if eligible(n, d)]
-        rng.shuffle(avail)                        # random tie-break, then fairness
-        avail.sort(key=lambda n: count[n])
 
+        # 1. Pattern holders keep their slot when they can.
+        for s, p in enumerate(pattern.get(d.weekday(), [])):
+            if p and eligible(p, d) and session_of(cols[s]) not in today.get(p, set()):
+                assign(row, s, p, d, today)
+        filled_by_pattern = sum(v is not None for v in row)
+
+        # 2. Cover the remaining slots, fairest first.
+        avail = [n for n in staff if eligible(n, d)]
+        rng.shuffle(avail)
+        avail.sort(key=lambda n: count[n])
+        free = [s for s in range(len(cols)) if row[s] is None]
         if double == "any":
-            for s, col in enumerate(cols):
-                sess = session_of(col)
+            for s in free:
+                sess = session_of(cols[s])
                 cands = [n for n in avail if sess not in today.get(n, set()) and eligible(n, d)]
                 if cands:
                     cands.sort(key=lambda n: (count[n], slot_count[n][s]))
                     assign(row, s, cands[0], d, today)
         else:
-            # Pass 1: everyone available gets at most one slot, fairest first, positions rotated.
-            chosen = avail[:len(cols)]
-            for s in range(len(cols)):
-                if not chosen:
+            # one slot each for people not yet on duty today
+            pool = [n for n in avail if n not in today][:len(free)]
+            for s in free:
+                if not pool:
                     break
-                chosen.sort(key=lambda n: slot_count[n][s])
-                assign(row, s, chosen.pop(0), d, today)
-            # Pass 2: still short, so let someone already on duty take the other half-day.
+                pool.sort(key=lambda n: slot_count[n][s])
+                assign(row, s, pool.pop(0), d, today)
+            # still short: someone already on duty takes the other half-day
             if double == "short":
-                for s, col in enumerate(cols):
+                for s in range(len(cols)):
                     if row[s] is not None:
                         continue
-                    sess = session_of(col)
+                    sess = session_of(cols[s])
                     cands = [n for n in today if sess not in today[n] and eligible(n, d)]
                     if cands:
                         cands.sort(key=lambda n: (count[n], slot_count[n][s]))
                         assign(row, s, cands[0], d, today)
+        if weekly:
+            covers += sum(v is not None for v in row) - filled_by_pattern
         records.append({"Date": d, "Day": d.strftime("%a"), **dict(zip(cols, row))})
-    return pd.DataFrame(records, columns=["Date", "Day", *cols])
+
+    out = pd.DataFrame(records, columns=["Date", "Day", *cols])
+    out.attrs["covers"] = covers
+    return out
 
 
 # ---------- Checks ----------

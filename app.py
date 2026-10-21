@@ -120,6 +120,11 @@ with st.sidebar:
              "people up to fill what's left.",
     )
     per_session = len(posts)
+    weekly = st.toggle(
+        "Same slot on the same weekday", value=True, key="weekly_in",
+        help="Each weekday keeps one line-up all month: whoever does AM MSW 1 on the first Monday does it every "
+             "Monday. When that person is away, someone else covers that day only.",
+    )
     st.divider()
     if st.button("Reshuffle roster", use_container_width=True,
                  help="Generate a different roster that follows the same rules."):
@@ -251,12 +256,13 @@ with tab_rules:
         st.warning("Couldn't read the weekday for: " + ", ".join(bad) + ". Use Mon, Tue, Wed, Thu or Fri.")
 
 # ---------- Generate when inputs change ----------
-sig = (tuple(staff), year, month, tuple(posts), double, ss.seed, tuple(sorted(holidays)),
+sig = (tuple(staff), year, month, tuple(posts), double, weekly, ss.seed, tuple(sorted(holidays)),
        tuple(sorted((n, tuple(sorted(ds))) for n, ds in leave.items())),
        tuple(sorted((n, r["exempt"], tuple(sorted(r["off_days"])), r["max_week"], r["max_month"])
                     for n, r in rules.items())))
 if sig != ss.sig:
-    ss.roster = eng.generate(staff, leave, year, month, ss.seed, posts, rules, holidays, double)
+    ss.roster = eng.generate(staff, leave, year, month, ss.seed, posts, rules, holidays, double, weekly)
+    ss.covers = ss.roster.attrs.get("covers", 0)
     ss.sig = sig
     ss.editor_ver += 1
 
@@ -305,6 +311,10 @@ with banner:
         if doubled:
             st.caption(f"Fewer than {slots} staff are in on {plural(len(doubled), 'day')}, so some people do both "
                        "AM and PM: " + ", ".join(doubled) + ".")
+    if weekly and len(edited):
+        total = len(edited) * slots
+        st.caption(f"Weekly pattern: {total - ss.get('covers', 0)} of {total} slots follow each weekday's line-up. "
+                   f"The other {ss.get('covers', 0)} are covers for people who are away that day.")
     if holidays:
         st.caption("No duty on public holidays: " + ", ".join(f"{d:%-d %b}" for d in sorted(holidays)) + ".")
     if ss.example_staff or ss.raw_rows is None:

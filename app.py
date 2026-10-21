@@ -4,11 +4,16 @@ Run locally:  streamlit run app.py
 """
 import calendar
 import datetime as dt
+import importlib
 
 import pandas as pd
 import streamlit as st
 
 import roster_engine as eng
+
+# Streamlit Cloud reruns the new app.py after a git push but keeps the old engine module in memory.
+# Reloading keeps the two in step.
+eng = importlib.reload(eng)
 
 st.set_page_config(page_title="Duty Roster Builder", layout="wide")
 
